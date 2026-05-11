@@ -412,13 +412,18 @@ def safe_get_stats_json(base_url: str, endpoint: str, params: Optional[dict] = N
 # UNDERDOG PARSER
 # ============================================================
 def classify_underdog_league(player: Dict[str, Any], app: Dict[str, Any], game_obj: Dict[str, Any], team: str, opponent: str, game: str) -> str:
+    """
+    Safe classification from Underdog metadata.
+    If metadata is unclear, return UNKNOWN instead of dropping the row.
+    Later, the stats matcher can verify NBA/WNBA.
+    """
     fields = []
     for obj in [player, app, game_obj]:
         if isinstance(obj, dict):
             for k in [
                 "league", "league_id", "league_name", "league_abbreviation", "organization",
                 "organization_name", "competition", "competition_name", "sport_league",
-                "title", "game_title", "match_title"
+                "title", "game_title", "match_title", "sport", "sport_name"
             ]:
                 v = obj.get(k)
                 if v is not None:
@@ -428,7 +433,7 @@ def classify_underdog_league(player: Dict[str, Any], app: Dict[str, Any], game_o
         return "WNBA"
     if re.search(r"\bnba\b", text) or any(name in text for name in NBA_TEAM_NAMES):
         return "NBA"
-    return "OTHER"
+    return "UNKNOWN"
 
 def player_name_from_player_obj(player: Dict[str, Any], app: Dict[str, Any]) -> str:
     direct = first_present(player, ["full_name", "fullName", "display_name", "displayName", "name", "player_name", "title"])
@@ -589,7 +594,8 @@ def fetch_underdog_lines(url: str, day_filter: str = "Today + Tomorrow", sport_f
             )
 
             league = classify_underdog_league(player, app, game_obj, team, opponent, game)
-            allowed = ["NBA", "WNBA"] if sport_filter == "NBA + WNBA" else [sport_filter]
+            allowed = ["NBA", "WNBA", "UNKNOWN"] if sport_filter == "NBA + WNBA" else [sport_filter, "UNKNOWN"]
+            # Do not drop UNKNOWN here. We need the row to reach the NBA/WNBA stats matcher.
             if league not in allowed:
                 skipped["not_target_league"] += 1
                 continue
@@ -754,59 +760,82 @@ def true_stat_projection(player_name: str, prop: str, line: float, league: str, 
         "stats_player_id": None,
         "match_score": 0.0,
         "match_name": "",
+        "verified_league": league,
         "l3": None, "l5": None, "l10": None, "season_avg": None, "minutes": None,
     }
     if not use_real_stats:
         fallback["note"] = "Real stats toggle off; using line fallback"
         return fallback
 
-    pid, score, match_name = best_player_match(player_name, league, season)
-    fallback["stats_player_id"] = pid
-    fallback["match_score"] = score
-    fallback["match_name"] = match_name
-    if not pid or score < 0.78:
-        fallback["note"] = f"{league} player match not strong enough ({score:.2f}); using line fallback"
-        return fallback
+    leagues_to_try = [league]
+    if league == "UNKNOWN":
+        leagues_to_try = ["NBA", "WNBA"]
 
-    logs = get_player_gamelog(pid, league, season)
-    if logs.empty:
-        fallback["note"] = f"{league} game logs empty; using line fallback"
-        return fallback
+    best_result = None
+    for lg in leagues_to_try:
+        ssn = season
+        if lg == "NBA" and "-" not in str(ssn):
+            ssn = current_nba_season()
+        if lg == "WNBA" and "-" in str(ssn):
+            ssn = current_wnba_season()
 
-    values = [stat_prop_value(r.to_dict(), prop) for _, r in logs.head(15).iterrows()]
-    values = [float(v) for v in values if v is not None]
-    if not values:
-        fallback["note"] = f"{league} values empty; using line fallback"
-        return fallback
+        pid, score, match_name = best_player_match(player_name, lg, ssn)
+        candidate_fallback = dict(fallback)
+        candidate_fallback["verified_league"] = lg
+        candidate_fallback["stats_player_id"] = pid
+        candidate_fallback["match_score"] = score
+        candidate_fallback["match_name"] = match_name
+        if not pid or score < 0.78:
+            candidate_fallback["note"] = f"{lg} player match not strong enough ({score:.2f}); using line fallback"
+            if best_result is None or score > best_result.get("match_score", 0):
+                best_result = candidate_fallback
+            continue
 
-    l3 = float(np.mean(values[:3])) if len(values) >= 3 else float(np.mean(values))
-    l5 = float(np.mean(values[:5])) if len(values) >= 5 else float(np.mean(values))
-    l10 = float(np.mean(values[:10])) if len(values) >= 10 else float(np.mean(values))
-    season_avg = float(np.mean(values))
-    minutes = float(pd.to_numeric(logs.head(5)["MIN"], errors="coerce").mean()) if "MIN" in logs.columns else None
+        logs = get_player_gamelog(pid, lg, ssn)
+        if logs.empty:
+            candidate_fallback["note"] = f"{lg} game logs empty; using line fallback"
+            if best_result is None or score > best_result.get("match_score", 0):
+                best_result = candidate_fallback
+            continue
 
-    projection = (l3 * 0.30) + (l5 * 0.25) + (l10 * 0.25) + (season_avg * 0.20)
+        values = [stat_prop_value(r.to_dict(), prop) for _, r in logs.head(15).iterrows()]
+        values = [float(v) for v in values if v is not None]
+        if not values:
+            candidate_fallback["note"] = f"{lg} values empty; using line fallback"
+            if best_result is None or score > best_result.get("match_score", 0):
+                best_result = candidate_fallback
+            continue
 
-    if minutes is not None:
-        if minutes < 18:
-            projection *= 0.90
-        elif minutes > 34:
-            projection *= 1.03
+        l3 = float(np.mean(values[:3])) if len(values) >= 3 else float(np.mean(values))
+        l5 = float(np.mean(values[:5])) if len(values) >= 5 else float(np.mean(values))
+        l10 = float(np.mean(values[:10])) if len(values) >= 10 else float(np.mean(values))
+        season_avg = float(np.mean(values))
+        minutes = float(pd.to_numeric(logs.head(5)["MIN"], errors="coerce").mean()) if "MIN" in logs.columns else None
 
-    recent_vals = values[:10]
-    std = float(np.std(recent_vals)) if len(recent_vals) >= 3 else float(PROP_CONFIG[prop].get("std", 3.0))
-    std = max(std, float(PROP_CONFIG[prop].get("std", 3.0)) * 0.55, 0.45)
+        projection = (l3 * 0.30) + (l5 * 0.25) + (l10 * 0.25) + (season_avg * 0.20)
+        if minutes is not None:
+            if minutes < 18:
+                projection *= 0.90
+            elif minutes > 34:
+                projection *= 1.03
 
-    return {
-        "projection": float(projection),
-        "std": float(std),
-        "source": f"{league.lower()}_gamelog",
-        "note": f"{league} logs: L3 {l3:.2f}, L5 {l5:.2f}, L10 {l10:.2f}, season {season_avg:.2f}",
-        "stats_player_id": pid,
-        "match_score": score,
-        "match_name": match_name,
-        "l3": l3, "l5": l5, "l10": l10, "season_avg": season_avg, "minutes": minutes,
-    }
+        recent_vals = values[:10]
+        std = float(np.std(recent_vals)) if len(recent_vals) >= 3 else float(PROP_CONFIG[prop].get("std", 3.0))
+        std = max(std, float(PROP_CONFIG[prop].get("std", 3.0)) * 0.55, 0.45)
+
+        return {
+            "projection": float(projection),
+            "std": float(std),
+            "source": f"{lg.lower()}_gamelog",
+            "note": f"{lg} logs: L3 {l3:.2f}, L5 {l5:.2f}, L10 {l10:.2f}, season {season_avg:.2f}",
+            "stats_player_id": pid,
+            "match_score": score,
+            "match_name": match_name,
+            "verified_league": lg,
+            "l3": l3, "l5": l5, "l10": l10, "season_avg": season_avg, "minutes": minutes,
+        }
+
+    return best_result or fallback
 
 
 # ============================================================
@@ -875,13 +904,15 @@ def model_one_prop(
     nba_season: str,
     wnba_season: str,
     market_blend: float,
+    sport_filter: str = "NBA + WNBA",
 ) -> Dict[str, Any]:
-    league = row.get("league", "NBA")
-    season = nba_season if league == "NBA" else wnba_season
+    source_league = row.get("league", "UNKNOWN")
+    season = nba_season if source_league == "NBA" else wnba_season if source_league == "WNBA" else nba_season
     learning = load_learning()
     learning_samples = int(learning.get("samples", 0) or 0)
-    real = true_stat_projection(row["player"], row["prop"], row["line"], league, use_real_stats, season)
+    real = true_stat_projection(row["player"], row["prop"], row["line"], source_league, use_real_stats, season)
     verified_projection = real["source"] in ["nba_gamelog", "wnba_gamelog"]
+    league = real.get("verified_league") if verified_projection else source_league
 
     pkey = normalize_name(f"{league}_{row['player']}")
     prop_key = f"{league}_{row['prop']}"
@@ -948,6 +979,8 @@ def model_one_prop(
 
     return {
         **row,
+        "league": league,
+        "source_league": source_league,
         "verified_projection": bool(verified_projection),
         "projection_source": real["source"],
         "stats_player_id": real.get("stats_player_id"),
@@ -996,6 +1029,12 @@ def build_board(rows: List[Dict[str, Any]], selected_props: List[str], player_se
         filtered.append(r)
 
     board = [model_one_prop(r, **model_kwargs) for r in filtered]
+    # If the source league was UNKNOWN, the stats matcher may verify NBA/WNBA.
+    # Keep both for NBA + WNBA, otherwise enforce the selected board after verification.
+    selected_sport = model_kwargs.get("sport_filter", "NBA + WNBA")
+    if selected_sport in ["NBA", "WNBA"]:
+        board = [b for b in board if b.get("league") in [selected_sport, "UNKNOWN"]]
+
     if not show_passes:
         board = [b for b in board if b["qualified"] or b["pick_prob"] >= min_display_prob]
     else:
@@ -1168,6 +1207,7 @@ board = build_board(
     nba_season=nba_season,
     wnba_season=wnba_season,
     market_blend=market_blend,
+    sport_filter=sport_filter,
 )
 
 if save_btn:
@@ -1203,7 +1243,7 @@ if not source_rows:
     st.markdown("""
     <div class='card card-bad'>
       <div class='big'>No Underdog lines loaded</div>
-      <div class='sub'>This app does not create fake props. Open Source Logs to see the endpoint status.</div>
+      <div class='sub'>This app does not create fake props. Open Source Logs to see the endpoint status. If Source Logs show many not_target_league skips, switch Sport board to NBA + WNBA and refresh.</div>
     </div>
     """, unsafe_allow_html=True)
 
