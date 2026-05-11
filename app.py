@@ -20,13 +20,18 @@ import json
 import math
 import time
 import difflib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+
+try:
+    import pytz
+except Exception:
+    pytz = None
 
 
 # ============================================================
@@ -62,6 +67,7 @@ DEFAULT_MIN_DATA_SCORE = int(os.getenv("MIN_DATA_SCORE", "68"))
 DEFAULT_MAX_KELLY = float(os.getenv("MAX_KELLY", "0.03"))
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "America/Los_Angeles")
 
 PROP_CONFIG = {
     "PTS": {"label": "Points", "min_edge": 1.8, "std": 5.8},
@@ -341,11 +347,84 @@ def get_nested(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
     except Exception:
         return default
 
+def local_tz():
+    if pytz:
+        try:
+            return pytz.timezone(APP_TIMEZONE)
+        except Exception:
+            return pytz.timezone("America/Los_Angeles")
+    return timezone(timedelta(hours=-7))
+
+def parse_datetime_any(value: Any) -> Optional[datetime]:
+    if value in [None, ""]:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # Common ISO/Z formats.
+    try:
+        ss = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ss)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(local_tz())
+    except Exception:
+        pass
+
+    # Epoch seconds or ms.
+    try:
+        x = float(s)
+        if x > 10_000_000_000:
+            x = x / 1000.0
+        return datetime.fromtimestamp(x, tz=timezone.utc).astimezone(local_tz())
+    except Exception:
+        pass
+
+    return None
+
+def date_bucket_for_start(start_value: Any) -> str:
+    dt = parse_datetime_any(start_value)
+    if not dt:
+        return "unknown"
+    today = datetime.now(local_tz()).date()
+    d = dt.date()
+    if d == today:
+        return "Today"
+    if d == today + timedelta(days=1):
+        return "Tomorrow"
+    if d < today:
+        return "Past"
+    return "Future"
+
+def is_start_passed(start_value: Any, grace_hours: float = 4.0) -> bool:
+    """
+    Treat games as stale only after start time + grace window, so live games don't vanish immediately.
+    """
+    dt = parse_datetime_any(start_value)
+    if not dt:
+        return False
+    return datetime.now(local_tz()) > dt + timedelta(hours=grace_hours)
+
+def game_matches_day_filter(start_value: Any, day_filter: str, include_live_grace: bool = True) -> bool:
+    bucket = date_bucket_for_start(start_value)
+    if bucket == "Past":
+        return False
+    if is_start_passed(start_value, 4.0 if include_live_grace else 0.0):
+        return False
+    if day_filter == "Today":
+        return bucket == "Today"
+    if day_filter == "Tomorrow":
+        return bucket == "Tomorrow"
+    if day_filter == "Today + Tomorrow":
+        return bucket in ["Today", "Tomorrow"]
+    if day_filter == "All Future":
+        return bucket in ["Today", "Tomorrow", "Future", "unknown"]
+    return True
+
 def looks_like_nba_row(player: Dict[str, Any], app: Dict[str, Any], game_obj: Dict[str, Any], team: str, opponent: str, game: str) -> bool:
     """
     Strict but not brittle NBA filter.
-    Returns True when the row contains NBA/team/basketball evidence.
-    If all league fields are missing but team/opponent are NBA abbreviations, it passes.
     """
     fields = []
     for obj in [player, app, game_obj]:
@@ -396,21 +475,67 @@ def player_name_from_player_obj(player: Dict[str, Any], app: Dict[str, Any]) -> 
     app_name = first_present(app, ["player_name", "name", "display_name", "displayName"], "")
     return str(app_name or "").strip()
 
-def line_value_from_underdog(line_item: Dict[str, Any], ou: Dict[str, Any], app_stat: Dict[str, Any]) -> Any:
-    # Underdog usually uses stat_value on the over_under_line.
-    return (
-        first_present(line_item, ["stat_value", "line", "value", "over_under_value", "display_stat_value"])
-        or first_present(ou, ["stat_value", "line", "value"])
-        or first_present(app_stat, ["value", "line", "stat_value"])
-    )
-
 def stat_name_from_underdog(line_item: Dict[str, Any], ou: Dict[str, Any], app_stat: Dict[str, Any]) -> Any:
     # Correct stat usually lives under over_under.appearance_stat.stat.
     return (
         first_present(app_stat, ["stat", "display_stat", "stat_type", "type"])
+        or first_present(ou, ["stat", "stat_type", "display_stat", "title"])
         or first_present(line_item, ["stat", "stat_type", "display_stat", "title"])
-        or first_present(ou, ["title", "stat", "stat_type", "display_stat"])
     )
+
+def line_value_from_underdog(line_item: Dict[str, Any], ou: Dict[str, Any], app_stat: Dict[str, Any]) -> Any:
+    """
+    Corrected line priority.
+
+    Underdog's real v5 board usually stores the displayed line at the
+    over_under level, often as stat_value. Some old code grabbed line_item fields
+    first, which can be stale/alternate/internal values. This function prioritizes:
+      1) over_under.stat_value / display_stat_value / line
+      2) line_item.stat_value only if over_under is missing
+      3) option fields only as last resort
+    """
+    preferred = first_present(ou, [
+        "stat_value", "display_stat_value", "line", "value", "over_under_value", "value_text"
+    ])
+    if preferred not in [None, ""]:
+        return preferred
+
+    second = first_present(line_item, [
+        "stat_value", "display_stat_value", "line", "value", "over_under_value"
+    ])
+    if second not in [None, ""]:
+        return second
+
+    # Sometimes options contain display_value/stat_value. Use median to avoid choosing Higher/Lower label.
+    opts = line_item.get("options")
+    vals = []
+    if isinstance(opts, list):
+        for opt in opts:
+            if not isinstance(opt, dict):
+                continue
+            v = first_present(opt, ["stat_value", "display_stat_value", "line", "value"])
+            fv = safe_float(v)
+            if fv is not None:
+                vals.append(fv)
+    if vals:
+        return float(np.median(vals))
+
+    return first_present(app_stat, ["line", "value", "stat_value"])
+
+def status_is_open_line(line_item: Dict[str, Any], ou: Dict[str, Any], app: Dict[str, Any], game_obj: Dict[str, Any]) -> bool:
+    """
+    Skip removed/suspended/settled rows when the feed marks them that way.
+    """
+    joined = " ".join(
+        str(first_present(obj, [
+            "status", "state", "display_status", "live_event_status", "status_text", "result_status"
+        ], "")).lower()
+        for obj in [line_item, ou, app, game_obj]
+        if isinstance(obj, dict)
+    )
+    bad = ["settled", "closed", "removed", "cancelled", "canceled", "suspended", "graded", "resulted", "inactive"]
+    return not any(x in joined for x in bad)
+
 
 
 # ============================================================
@@ -454,7 +579,7 @@ def normalize_prop_row(
     }
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_underdog_lines(url: str, strict_nba: bool = True) -> List[Dict[str, Any]]:
+def fetch_underdog_lines(url: str, strict_nba: bool = True, day_filter: str = 'Today + Tomorrow') -> List[Dict[str, Any]]:
     """
     Pull real Underdog NBA lines only.
 
@@ -490,7 +615,7 @@ def fetch_underdog_lines(url: str, strict_nba: bool = True) -> List[Dict[str, An
         return []
 
     rows: List[Dict[str, Any]] = []
-    skipped = {"no_join": 0, "not_nba": 0, "bad_prop": 0, "bad_line": 0}
+    skipped = {"no_join": 0, "not_nba": 0, "bad_prop": 0, "bad_line": 0, "bad_date": 0, "closed": 0}
 
     # Current v5 shape: players, appearances, games/matches, over_under_lines
     if isinstance(data, dict) and isinstance(data.get("players"), list) and isinstance(data.get("appearances"), list):
@@ -576,6 +701,14 @@ def fetch_underdog_lines(url: str, strict_nba: bool = True) -> List[Dict[str, An
                 skipped["not_nba"] += 1
                 continue
 
+            if not status_is_open_line(line_item, ou, app, game_obj):
+                skipped["closed"] += 1
+                continue
+
+            if not game_matches_day_filter(start_time, day_filter):
+                skipped["bad_date"] += 1
+                continue
+
             option_price = DEFAULT_PRICE
             options = line_item.get("options")
             if isinstance(options, list) and options:
@@ -611,6 +744,8 @@ def fetch_underdog_lines(url: str, strict_nba: bool = True) -> List[Dict[str, An
             if row:
                 row["appearance_id"] = str(appearance_id)
                 row["player_id"] = str(player_id)
+                row["date_bucket"] = date_bucket_for_start(start_time)
+                row["local_start"] = str(parse_datetime_any(start_time) or "")
                 rows.append(row)
 
         log_request("Underdog", "OK", f"{len(rows)} NBA rows from {used_url}; skipped={skipped}")
@@ -694,6 +829,16 @@ def fetch_underdog_lines(url: str, strict_nba: bool = True) -> List[Dict[str, An
             skipped["not_nba"] += 1
             continue
 
+        start_time = first_present(attrs, ["scheduled_at", "start_time"], "") or first_present(app, ["scheduled_at"], "")
+
+        if not status_is_open_line(attrs, over_under, app, {}):
+            skipped["closed"] += 1
+            continue
+
+        if not game_matches_day_filter(start_time, day_filter):
+            skipped["bad_date"] += 1
+            continue
+
         row = normalize_prop_row(
             player=player_name,
             prop=stat_type,
@@ -701,7 +846,7 @@ def fetch_underdog_lines(url: str, strict_nba: bool = True) -> List[Dict[str, An
             team=team,
             opponent=opponent,
             game=game,
-            start_time=first_present(attrs, ["scheduled_at", "start_time"], "") or first_present(app, ["scheduled_at"], ""),
+            start_time=start_time,
             price=DEFAULT_PRICE,
             raw={
                 "appearance_id": appearance_id,
@@ -1123,6 +1268,7 @@ with st.sidebar:
 
     st.markdown("### Source")
     strict_nba_filter = st.toggle("Strict NBA-only filter", value=True)
+    day_filter = st.radio("Game date filter", ["Today + Tomorrow", "Today", "Tomorrow", "All Future"], index=0)
     st.write("Source: ✅ Underdog only")
     st.write("Endpoint:", UNDERDOG_API_URL[:42] + ("..." if len(UNDERDOG_API_URL) > 42 else ""))
 
@@ -1162,7 +1308,7 @@ if rebuild_btn:
 
 if refresh or "underdog_rows" not in st.session_state:
     with st.spinner("Pulling real Underdog lines..."):
-        st.session_state["underdog_rows"] = fetch_underdog_lines(UNDERDOG_API_URL, strict_nba_filter)
+        st.session_state["underdog_rows"] = fetch_underdog_lines(UNDERDOG_API_URL, strict_nba_filter, day_filter)
         st.session_state["last_refresh"] = now_iso()
 
 source_rows = st.session_state.get("underdog_rows", [])
@@ -1250,6 +1396,7 @@ with tabs[0]:
           <span class='badge'>Pick: {p['pick_side']}</span>
           <span class='badge'>Line: {p['line']}</span>
           <span class='badge'>State: {p['markov_state']}</span>
+          <span class='badge'>Date: {p.get('date_bucket','')}</span>
           <div class='metric-grid'>
             <div class='metric-box'><div class='metric-label'>Projection</div><div class='metric-value'>{p['projection']:.2f}</div><div class='metric-sub'>Edge {p['edge']:+.2f}</div></div>
             <div class='metric-box'><div class='metric-label'>Over</div><div class='metric-value'>{p['over_prob']*100:.1f}%</div><div class='metric-sub'>Under {p['under_prob']*100:.1f}%</div></div>
@@ -1265,7 +1412,7 @@ with tabs[0]:
 with tabs[1]:
     if board:
         display_cols = [
-            "signal", "player", "team", "game", "prop", "line", "pick_side",
+            "signal", "player", "team", "game", "date_bucket", "local_start", "prop", "line", "pick_side",
             "projection", "over_prob", "under_prob", "pick_prob", "edge", "ev",
             "kelly", "stake", "clv", "data_score", "markov_state", "reasons",
         ]
