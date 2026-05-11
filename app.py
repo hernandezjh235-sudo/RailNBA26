@@ -93,6 +93,19 @@ PROP_ALIASES = {
     "turnovers": "TO", "tos": "TO", "to": "TO",
 }
 
+NBA_TEAM_ABBRS = {
+    "ATL","BOS","BKN","CHA","CHI","CLE","DAL","DEN","DET","GSW","HOU","IND",
+    "LAC","LAL","MEM","MIA","MIL","MIN","NOP","NYK","OKC","ORL","PHI","PHX",
+    "POR","SAC","SAS","TOR","UTA","WAS"
+}
+
+NBA_TEAM_NAMES = {
+    "hawks","celtics","nets","hornets","bulls","cavaliers","mavericks","nuggets",
+    "pistons","warriors","rockets","pacers","clippers","lakers","grizzlies","heat",
+    "bucks","timberwolves","pelicans","knicks","thunder","magic","76ers","suns",
+    "trail blazers","blazers","kings","spurs","raptors","jazz","wizards"
+}
+
 
 # ============================================================
 # STYLE
@@ -305,6 +318,101 @@ def safe_get_json(url: str, timeout: int = 30) -> Any:
         return None
 
 
+
+# ============================================================
+# UNDERDOG DATA-SHAPE HELPERS
+# ============================================================
+def first_present(d: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+    if not isinstance(d, dict):
+        return default
+    for k in keys:
+        if k in d and d.get(k) not in [None, ""]:
+            return d.get(k)
+    return default
+
+def get_nested(d: Dict[str, Any], path: List[str], default: Any = None) -> Any:
+    cur = d
+    try:
+        for p in path:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(p)
+        return cur if cur not in [None, ""] else default
+    except Exception:
+        return default
+
+def looks_like_nba_row(player: Dict[str, Any], app: Dict[str, Any], game_obj: Dict[str, Any], team: str, opponent: str, game: str) -> bool:
+    """
+    Strict but not brittle NBA filter.
+    Returns True when the row contains NBA/team/basketball evidence.
+    If all league fields are missing but team/opponent are NBA abbreviations, it passes.
+    """
+    fields = []
+    for obj in [player, app, game_obj]:
+        if isinstance(obj, dict):
+            for k in [
+                "sport", "sport_id", "sport_name", "league", "league_id", "league_name",
+                "organization", "organization_name", "competition", "competition_name",
+                "title", "game_type", "match_type"
+            ]:
+                v = obj.get(k)
+                if v is not None:
+                    fields.append(str(v).lower())
+
+    joined = " ".join(fields + [str(team).lower(), str(opponent).lower(), str(game).lower()])
+
+    if any(token in joined for token in ["nba", "basketball"]):
+        return True
+
+    team_up = str(team or "").upper()
+    opp_up = str(opponent or "").upper()
+    if team_up in NBA_TEAM_ABBRS or opp_up in NBA_TEAM_ABBRS:
+        return True
+
+    game_l = str(game or "").lower()
+    if any(name in game_l for name in NBA_TEAM_NAMES):
+        return True
+
+    return False
+
+def player_name_from_player_obj(player: Dict[str, Any], app: Dict[str, Any]) -> str:
+    if not isinstance(player, dict):
+        player = {}
+    if not isinstance(app, dict):
+        app = {}
+
+    direct = first_present(player, [
+        "full_name", "fullName", "display_name", "displayName", "name", "player_name", "title"
+    ])
+    if direct:
+        return str(direct).strip()
+
+    first = first_present(player, ["first_name", "firstName", "first", "given_name"], "")
+    last = first_present(player, ["last_name", "lastName", "last", "family_name"], "")
+    combo = f"{first} {last}".strip()
+    if combo:
+        return combo
+
+    app_name = first_present(app, ["player_name", "name", "display_name", "displayName"], "")
+    return str(app_name or "").strip()
+
+def line_value_from_underdog(line_item: Dict[str, Any], ou: Dict[str, Any], app_stat: Dict[str, Any]) -> Any:
+    # Underdog usually uses stat_value on the over_under_line.
+    return (
+        first_present(line_item, ["stat_value", "line", "value", "over_under_value", "display_stat_value"])
+        or first_present(ou, ["stat_value", "line", "value"])
+        or first_present(app_stat, ["value", "line", "stat_value"])
+    )
+
+def stat_name_from_underdog(line_item: Dict[str, Any], ou: Dict[str, Any], app_stat: Dict[str, Any]) -> Any:
+    # Correct stat usually lives under over_under.appearance_stat.stat.
+    return (
+        first_present(app_stat, ["stat", "display_stat", "stat_type", "type"])
+        or first_present(line_item, ["stat", "stat_type", "display_stat", "title"])
+        or first_present(ou, ["title", "stat", "stat_type", "display_stat"])
+    )
+
+
 # ============================================================
 # UNDERDOG PARSER
 # ============================================================
@@ -346,14 +454,17 @@ def normalize_prop_row(
     }
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
+def fetch_underdog_lines(url: str, strict_nba: bool = True) -> List[Dict[str, Any]]:
     """
-    Pull real Underdog lines only.
+    Pull real Underdog NBA lines only.
 
-    Primary endpoint:
-      https://api.underdogfantasy.com/beta/v5/over_under_lines
-
-    This function supports both current v5 top-level structure and older included/data shapes.
+    Important fix:
+    - Lines are joined strictly through:
+      over_under_lines[*].over_under.appearance_stat.appearance_id
+      -> appearances[id].player_id
+      -> players[id]
+    - Cross-sport rows are filtered out when strict_nba=True.
+    - Rows with missing appearance/player joins are skipped and logged.
     """
     candidate_urls = []
     if url:
@@ -379,17 +490,18 @@ def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
         return []
 
     rows: List[Dict[str, Any]] = []
+    skipped = {"no_join": 0, "not_nba": 0, "bad_prop": 0, "bad_line": 0}
 
-    # Current v5 shape: players, appearances, games, over_under_lines
+    # Current v5 shape: players, appearances, games/matches, over_under_lines
     if isinstance(data, dict) and isinstance(data.get("players"), list) and isinstance(data.get("appearances"), list):
         players_raw = data.get("players", []) or []
         appearances_raw = data.get("appearances", []) or []
         lines_raw = data.get("over_under_lines", []) or []
-        games_raw = data.get("games", []) or []
+        games_raw = data.get("games", []) or data.get("matches", []) or []
 
-        players = {str(p.get("id")): p for p in players_raw if isinstance(p, dict)}
-        appearances = {str(a.get("id")): a for a in appearances_raw if isinstance(a, dict)}
-        games = {str(g.get("id")): g for g in games_raw if isinstance(g, dict)}
+        players = {str(p.get("id")): p for p in players_raw if isinstance(p, dict) and p.get("id") is not None}
+        appearances = {str(a.get("id")): a for a in appearances_raw if isinstance(a, dict) and a.get("id") is not None}
+        games = {str(g.get("id")): g for g in games_raw if isinstance(g, dict) and g.get("id") is not None}
 
         for line_item in lines_raw:
             if not isinstance(line_item, dict):
@@ -398,59 +510,71 @@ def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
             ou = line_item.get("over_under") if isinstance(line_item.get("over_under"), dict) else {}
             app_stat = ou.get("appearance_stat") if isinstance(ou.get("appearance_stat"), dict) else {}
 
+            # THE IMPORTANT JOIN: line -> appearance -> player.
             appearance_id = (
-                app_stat.get("appearance_id")
-                or line_item.get("appearance_id")
-                or line_item.get("appearanceId")
+                first_present(app_stat, ["appearance_id", "appearanceId"])
+                or first_present(ou, ["appearance_id", "appearanceId"])
+                or first_present(line_item, ["appearance_id", "appearanceId"])
             )
-            stat_name = (
-                app_stat.get("stat")
-                or app_stat.get("display_stat")
-                or line_item.get("stat")
-                or line_item.get("stat_type")
-                or line_item.get("display_stat")
-                or ou.get("title")
-            )
-            line_value = (
-                line_item.get("stat_value")
-                or line_item.get("line")
-                or line_item.get("value")
-                or ou.get("line")
-                or ou.get("stat_value")
-                or app_stat.get("value")
-            )
-
             app = appearances.get(str(appearance_id), {}) if appearance_id is not None else {}
-            player_id = app.get("player_id") or app.get("playerId") or line_item.get("player_id")
+
+            player_id = (
+                first_present(app, ["player_id", "playerId"])
+                or first_present(line_item, ["player_id", "playerId"])
+                or first_present(ou, ["player_id", "playerId"])
+            )
             player = players.get(str(player_id), {}) if player_id is not None else {}
 
-            first = player.get("first_name") or player.get("firstName") or ""
-            last = player.get("last_name") or player.get("lastName") or ""
-            player_name = (
-                player.get("full_name")
-                or player.get("fullName")
-                or player.get("display_name")
-                or app.get("player_name")
-                or f"{first} {last}".strip()
-            )
+            if not app or not player:
+                skipped["no_join"] += 1
+                continue
 
-            team = app.get("team_abbr") or app.get("team") or player.get("team") or player.get("team_abbr") or ""
-            opponent = app.get("opponent_abbr") or app.get("opponent") or ""
-            game_id = app.get("game_id") or app.get("match_id") or line_item.get("game_id") or ""
-            game_obj = games.get(str(game_id), {}) if game_id else {}
-            game = (
-                app.get("match_title")
-                or line_item.get("match_title")
-                or game_obj.get("title")
-                or (str(game_obj.get("away_team_name", "")) + (" @ " if game_obj else "") + str(game_obj.get("home_team_name", ""))).strip()
-            )
-            start_time = (
-                app.get("scheduled_at")
-                or app.get("start_time")
-                or game_obj.get("scheduled_at")
-                or game_obj.get("start_time")
+            stat_name = stat_name_from_underdog(line_item, ou, app_stat)
+            prop_key = clean_prop_type(stat_name)
+            if prop_key not in PROP_CONFIG:
+                skipped["bad_prop"] += 1
+                continue
+
+            line_value = line_value_from_underdog(line_item, ou, app_stat)
+            if safe_float(line_value) is None:
+                skipped["bad_line"] += 1
+                continue
+
+            player_name = player_name_from_player_obj(player, app)
+
+            team = (
+                first_present(app, ["team_abbr", "teamAbbr", "team"])
+                or first_present(player, ["team_abbr", "teamAbbr", "team"])
                 or ""
             )
+            opponent = first_present(app, ["opponent_abbr", "opponentAbbr", "opponent"], "")
+
+            game_id = (
+                first_present(app, ["game_id", "gameId", "match_id", "matchId"])
+                or first_present(line_item, ["game_id", "gameId", "match_id", "matchId"])
+            )
+            game_obj = games.get(str(game_id), {}) if game_id is not None else {}
+
+            game = (
+                first_present(app, ["match_title", "matchTitle", "game_title", "gameTitle"])
+                or first_present(line_item, ["match_title", "matchTitle", "game"])
+                or first_present(game_obj, ["title", "name", "match_title", "matchTitle"])
+                or ""
+            )
+            if not game and isinstance(game_obj, dict):
+                away = first_present(game_obj, ["away_team_name", "awayTeamName", "away_team", "awayTeam"], "")
+                home = first_present(game_obj, ["home_team_name", "homeTeamName", "home_team", "homeTeam"], "")
+                game = f"{away} @ {home}".strip(" @")
+
+            start_time = (
+                first_present(app, ["scheduled_at", "scheduledAt", "start_time", "startTime"])
+                or first_present(game_obj, ["scheduled_at", "scheduledAt", "start_time", "startTime"])
+                or ""
+            )
+
+            if strict_nba and not looks_like_nba_row(player, app, game_obj, team, opponent, game):
+                skipped["not_nba"] += 1
+                continue
 
             option_price = DEFAULT_PRICE
             options = line_item.get("options")
@@ -475,16 +599,25 @@ def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
                 game=game,
                 start_time=start_time,
                 price=option_price,
-                raw=line_item,
+                raw={
+                    "line_id": line_item.get("id"),
+                    "appearance_id": appearance_id,
+                    "player_id": player_id,
+                    "stat_name": stat_name,
+                    "game_id": game_id,
+                    "raw_line": line_item,
+                },
             )
             if row:
+                row["appearance_id"] = str(appearance_id)
+                row["player_id"] = str(player_id)
                 rows.append(row)
 
-        log_request("Underdog", "OK", f"{len(rows)} rows from {used_url}")
-        save_json(SNAPSHOT_FILE, {"created_at": now_iso(), "rows": rows})
+        log_request("Underdog", "OK", f"{len(rows)} NBA rows from {used_url}; skipped={skipped}")
+        save_json(SNAPSHOT_FILE, {"created_at": now_iso(), "rows": rows, "skipped": skipped, "url": used_url})
         return rows
 
-    # Older JSON/API fallback shape
+    # Older JSON/API fallback shape. This is stricter than before.
     included = data.get("included", []) if isinstance(data, dict) else []
     data_items = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
     over_under_lines = data.get("over_under_lines", []) if isinstance(data, dict) else []
@@ -498,6 +631,7 @@ def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
         typ = str(item.get("type", "")).lower()
         item_id = str(item.get("id", ""))
         attrs = item.get("attributes", {}) or {}
+        attrs["id"] = item_id
         if "appearance" in typ:
             appearances[item_id] = attrs
         if "player" in typ:
@@ -518,20 +652,15 @@ def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
         over_under = attrs.get("over_under") if isinstance(attrs.get("over_under"), dict) else {}
         app_stat = over_under.get("appearance_stat") if isinstance(over_under.get("appearance_stat"), dict) else {}
 
-        stat_type = (
-            attrs.get("stat_type")
-            or attrs.get("stat")
-            or attrs.get("display_stat")
-            or app_stat.get("stat")
-            or over_under.get("title")
-        )
-        line = (
-            attrs.get("line")
-            or attrs.get("stat_value")
-            or attrs.get("value")
-            or over_under.get("line")
-            or over_under.get("stat_value")
-        )
+        stat_type = stat_name_from_underdog(attrs, over_under, app_stat)
+        if clean_prop_type(stat_type) not in PROP_CONFIG:
+            skipped["bad_prop"] += 1
+            continue
+
+        line = line_value_from_underdog(attrs, over_under, app_stat)
+        if safe_float(line) is None:
+            skipped["bad_line"] += 1
+            continue
 
         appearance_id = None
         player_id = None
@@ -544,35 +673,50 @@ def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
+        if not appearance_id:
+            appearance_id = first_present(app_stat, ["appearance_id", "appearanceId"])
+
         app = appearances.get(str(appearance_id), {}) if appearance_id else {}
+        if not player_id:
+            player_id = first_present(app, ["player_id", "playerId"])
         pl = players.get(str(player_id), {}) if player_id else {}
 
-        player_name = (
-            attrs.get("player_name")
-            or attrs.get("player")
-            or attrs.get("athlete_name")
-            or app.get("player_name")
-            or app.get("name")
-            or app.get("display_name")
-            or (str(pl.get("first_name", "")) + " " + str(pl.get("last_name", ""))).strip()
-        )
+        if not pl:
+            skipped["no_join"] += 1
+            continue
+
+        player_name = player_name_from_player_obj(pl, app)
+        team = first_present(attrs, ["team", "team_abbr"], "") or first_present(app, ["team_abbr", "team"], "")
+        opponent = first_present(attrs, ["opponent"], "") or first_present(app, ["opponent_abbr", "opponent"], "")
+        game = first_present(attrs, ["match_title", "game"], "") or first_present(app, ["match_title"], "")
+
+        if strict_nba and not looks_like_nba_row(pl, app, {}, team, opponent, game):
+            skipped["not_nba"] += 1
+            continue
 
         row = normalize_prop_row(
             player=player_name,
             prop=stat_type,
             line=line,
-            team=attrs.get("team") or attrs.get("team_abbr") or app.get("team_abbr") or app.get("team") or "",
-            opponent=attrs.get("opponent") or app.get("opponent_abbr") or app.get("opponent") or "",
-            game=attrs.get("match_title") or attrs.get("game") or app.get("match_title") or "",
-            start_time=attrs.get("scheduled_at") or attrs.get("start_time") or app.get("scheduled_at") or "",
+            team=team,
+            opponent=opponent,
+            game=game,
+            start_time=first_present(attrs, ["scheduled_at", "start_time"], "") or first_present(app, ["scheduled_at"], ""),
             price=DEFAULT_PRICE,
-            raw=attrs,
+            raw={
+                "appearance_id": appearance_id,
+                "player_id": player_id,
+                "stat_name": stat_type,
+                "raw_line": attrs,
+            },
         )
         if row:
+            row["appearance_id"] = str(appearance_id)
+            row["player_id"] = str(player_id)
             rows.append(row)
 
-    log_request("Underdog", "OK", f"{len(rows)} rows from {used_url} fallback parser")
-    save_json(SNAPSHOT_FILE, {"created_at": now_iso(), "rows": rows})
+    log_request("Underdog", "OK", f"{len(rows)} NBA rows from {used_url} fallback parser; skipped={skipped}")
+    save_json(SNAPSHOT_FILE, {"created_at": now_iso(), "rows": rows, "skipped": skipped, "url": used_url})
     return rows
 
 
@@ -978,6 +1122,7 @@ with st.sidebar:
     show_passes = st.toggle("Show PASS rows", value=True)
 
     st.markdown("### Source")
+    strict_nba_filter = st.toggle("Strict NBA-only filter", value=True)
     st.write("Source: ✅ Underdog only")
     st.write("Endpoint:", UNDERDOG_API_URL[:42] + ("..." if len(UNDERDOG_API_URL) > 42 else ""))
 
@@ -1017,7 +1162,7 @@ if rebuild_btn:
 
 if refresh or "underdog_rows" not in st.session_state:
     with st.spinner("Pulling real Underdog lines..."):
-        st.session_state["underdog_rows"] = fetch_underdog_lines(UNDERDOG_API_URL)
+        st.session_state["underdog_rows"] = fetch_underdog_lines(UNDERDOG_API_URL, strict_nba_filter)
         st.session_state["last_refresh"] = now_iso()
 
 source_rows = st.session_state.get("underdog_rows", [])
