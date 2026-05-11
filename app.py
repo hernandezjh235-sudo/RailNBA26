@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 # ============================================================
-# DEVIL PICKS — REAL RAILWAY PRO BUILD
-# NBA Props Engine for Underdog + Sleeper + Odds API fallback
-# Streamlit / GitHub / Railway ready
+# DEVIL PICKS — UNDERDOG ONLY REAL RAIL BUILD
+# Railway / GitHub / Streamlit ready
 #
-# This is not a demo app:
-# - Pulls real prop rows from enabled sources when keys/feeds are available
-# - No fake picks are generated
-# - Missing/blocked feeds show source errors instead of dummy data
-# - Saves official snapshots
-# - Supports manual grading + learning loop
-# - Bayesian, Markov, Monte Carlo, optional XGBoost/GBM hooks
+# Real Underdog-only prop engine:
+# - Pulls Underdog lines only
+# - No Sleeper
+# - No Odds API
+# - No fake demo rows
+# - Clean UI with toggles/buttons
+# - Monte Carlo + Bayesian + Markov + learning + CLV
+# - Save official picks
+# - Manual grading after games
 # ============================================================
 
 import os
@@ -19,7 +20,7 @@ import json
 import math
 import time
 import difflib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -27,22 +28,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
-try:
-    from sklearn.ensemble import GradientBoostingClassifier
-except Exception:
-    GradientBoostingClassifier = None
-
-try:
-    import xgboost as xgb
-except Exception:
-    xgb = None
-
 
 # ============================================================
-# APP CONFIG
+# CONFIG
 # ============================================================
 st.set_page_config(
-    page_title="Devil Picks — Real Rail Pro",
+    page_title="Devil Picks — Underdog Only",
     page_icon="😈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -52,37 +43,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(BASE_DIR, "data"))
 os.makedirs(DATA_DIR, exist_ok=True)
 
-PICK_LOG = os.path.join(DATA_DIR, "official_pick_log.json")
-RESULT_LOG = os.path.join(DATA_DIR, "graded_result_log.json")
-LEARN_FILE = os.path.join(DATA_DIR, "learning_state.json")
-CLV_FILE = os.path.join(DATA_DIR, "clv_tracker.json")
-REQUEST_LOG_FILE = os.path.join(DATA_DIR, "source_request_log.json")
-SNAPSHOT_FILE = os.path.join(DATA_DIR, "latest_board_snapshot.json")
-MODEL_STATE_FILE = os.path.join(DATA_DIR, "model_state.json")
-
-# Environment variables
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-APIFY_TOKEN = os.getenv("APIFY_TOKEN", "").strip()
-OPTICODDS_API_KEY = os.getenv("OPTICODDS_API_KEY", "").strip()
-
-ENABLE_UNDERDOG_DEFAULT = os.getenv("ENABLE_UNDERDOG", "true").lower() == "true"
-ENABLE_SLEEPER_DEFAULT = os.getenv("ENABLE_SLEEPER", "true").lower() == "true"
-ENABLE_ODDS_API_DEFAULT = os.getenv("ENABLE_ODDS_API", "false").lower() == "true"
-ENABLE_OPTICODDS_DEFAULT = os.getenv("ENABLE_OPTICODDS", "false").lower() == "true"
-
-SPORT_KEY = os.getenv("SPORT_KEY", "basketball_nba")
-LEAGUE_FILTER = os.getenv("LEAGUE_FILTER", "NBA").upper()
+PICK_LOG = os.path.join(DATA_DIR, "underdog_official_picks.json")
+RESULT_LOG = os.path.join(DATA_DIR, "underdog_results.json")
+LEARN_FILE = os.path.join(DATA_DIR, "underdog_learning.json")
+CLV_FILE = os.path.join(DATA_DIR, "underdog_clv.json")
+REQUEST_LOG_FILE = os.path.join(DATA_DIR, "underdog_source_logs.json")
+SNAPSHOT_FILE = os.path.join(DATA_DIR, "latest_underdog_board.json")
 
 UNDERDOG_API_URL = os.getenv(
     "UNDERDOG_API_URL",
-    "https://api.underdogfantasy.com/v1/over_under_lines",
+    "https://api.underdogfantasy.com/beta/v5/over_under_lines",
 ).strip()
-
-# Apify actors can be changed in Railway env vars if you use a different scraper actor.
-APIFY_UNDERDOG_ACTOR = os.getenv("APIFY_UNDERDOG_ACTOR", "zen-studio/underdog-player-props").strip()
-APIFY_SLEEPER_ACTOR = os.getenv("APIFY_SLEEPER_ACTOR", "zen-studio/sleeper-player-props").strip()
-
-ODDS_BASE = "https://api.the-odds-api.com/v4"
 
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "-110"))
 DEFAULT_SIM_COUNT = int(os.getenv("PROP_SIMULATION_COUNT", "12000"))
@@ -90,17 +61,20 @@ DEFAULT_MIN_PROB = float(os.getenv("MIN_PROB", "0.57"))
 DEFAULT_MIN_DATA_SCORE = int(os.getenv("MIN_DATA_SCORE", "68"))
 DEFAULT_MAX_KELLY = float(os.getenv("MAX_KELLY", "0.03"))
 DEFAULT_BANKROLL = float(os.getenv("BANKROLL", "1000"))
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "180"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
 
 PROP_CONFIG = {
-    "PTS": {"label": "Points", "min_edge": 1.8, "std": 5.8, "odds_market": "player_points"},
-    "REB": {"label": "Rebounds", "min_edge": 1.5, "std": 3.0, "odds_market": "player_rebounds"},
-    "AST": {"label": "Assists", "min_edge": 1.5, "std": 2.8, "odds_market": "player_assists"},
-    "PRA": {"label": "Pts + Reb + Ast", "min_edge": 2.5, "std": 7.0, "odds_market": "player_points_rebounds_assists"},
-    "PR": {"label": "Pts + Reb", "min_edge": 2.2, "std": 6.2, "odds_market": "player_points_rebounds"},
-    "PA": {"label": "Pts + Ast", "min_edge": 2.2, "std": 6.2, "odds_market": "player_points_assists"},
-    "RA": {"label": "Reb + Ast", "min_edge": 2.0, "std": 4.2, "odds_market": "player_rebounds_assists"},
-    "3PM": {"label": "3PM", "min_edge": 0.65, "std": 1.35, "odds_market": "player_threes"},
+    "PTS": {"label": "Points", "min_edge": 1.8, "std": 5.8},
+    "REB": {"label": "Rebounds", "min_edge": 1.5, "std": 3.0},
+    "AST": {"label": "Assists", "min_edge": 1.5, "std": 2.8},
+    "PRA": {"label": "Pts + Reb + Ast", "min_edge": 2.5, "std": 7.0},
+    "PR": {"label": "Pts + Reb", "min_edge": 2.2, "std": 6.2},
+    "PA": {"label": "Pts + Ast", "min_edge": 2.2, "std": 6.2},
+    "RA": {"label": "Reb + Ast", "min_edge": 2.0, "std": 4.2},
+    "3PM": {"label": "3PM", "min_edge": 0.65, "std": 1.35},
+    "BLK": {"label": "Blocks", "min_edge": 0.45, "std": 0.85},
+    "STL": {"label": "Steals", "min_edge": 0.45, "std": 0.85},
+    "TO": {"label": "Turnovers", "min_edge": 0.70, "std": 1.25},
 }
 
 PROP_ALIASES = {
@@ -114,6 +88,9 @@ PROP_ALIASES = {
     "rebounds assists": "RA", "rebounds + assists": "RA", "rebs asts": "RA", "ra": "RA",
     "3 pointers made": "3PM", "3-pointers made": "3PM", "three pointers made": "3PM",
     "threes": "3PM", "3pm": "3PM", "fg3m": "3PM", "made threes": "3PM",
+    "blocks": "BLK", "blocked shots": "BLK", "blk": "BLK",
+    "steals": "STL", "stl": "STL",
+    "turnovers": "TO", "tos": "TO", "to": "TO",
 }
 
 
@@ -199,7 +176,7 @@ h1,h2,h3 {color:#fff;}
 
 
 # ============================================================
-# SAFE STORAGE / LOGGING
+# STORAGE
 # ============================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -229,13 +206,13 @@ def log_request(source: str, status: str, message: str = "") -> None:
         "time": now_iso(),
         "source": str(source)[:200],
         "status": str(status)[:90],
-        "message": str(message)[:500],
+        "message": str(message)[:700],
     })
     save_json(REQUEST_LOG_FILE, rows[-1000:])
 
 
 # ============================================================
-# BASIC HELPERS
+# HELPERS
 # ============================================================
 def safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
@@ -261,16 +238,6 @@ def normalize_name(name: Any) -> str:
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
     return " ".join(s.split())
 
-def name_score(a: Any, b: Any) -> float:
-    a, b = normalize_name(a), normalize_name(b)
-    if not a or not b:
-        return 0.0
-    if a == b:
-        return 1.0
-    if a in b or b in a:
-        return 0.94
-    return difflib.SequenceMatcher(None, a, b).ratio()
-
 def clean_prop_type(raw: Any) -> str:
     s = normalize_name(raw)
     if s in PROP_ALIASES:
@@ -286,12 +253,6 @@ def american_to_decimal(odds: Any) -> Optional[float]:
     if odds is None:
         return None
     return 1 + odds / 100 if odds > 0 else 1 + 100 / abs(odds)
-
-def american_to_implied(odds: Any) -> Optional[float]:
-    odds = safe_float(odds)
-    if odds is None:
-        return None
-    return 100 / (odds + 100) if odds > 0 else abs(odds) / (abs(odds) + 100)
 
 def expected_value(prob: Optional[float], odds: Any = DEFAULT_PRICE) -> Optional[float]:
     dec = american_to_decimal(odds)
@@ -320,78 +281,58 @@ def pct(x: Optional[float]) -> str:
         return "N/A"
     return f"{x * 100:.1f}%"
 
-def source_key(source: str) -> str:
-    return str(source).split("/")[0].strip()
-
 
 # ============================================================
 # HTTP
 # ============================================================
-def safe_get_json(url: str, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 25) -> Any:
+def safe_get_json(url: str, timeout: int = 30) -> Any:
     try:
-        h = {
-            "User-Agent": "Mozilla/5.0 DevilPicksRealRail/4.0",
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "application/json,text/plain,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://underdogfantasy.com/",
+            "Origin": "https://underdogfantasy.com",
             "Connection": "keep-alive",
         }
-        if headers:
-            h.update(headers)
-        r = requests.get(url, params=params, headers=h, timeout=timeout)
+        r = requests.get(url, headers=headers, timeout=timeout)
         if r.status_code != 200:
-            log_request(url, f"HTTP {r.status_code}", r.text[:400])
+            log_request(url, f"HTTP {r.status_code}", r.text[:500])
             return None
         return r.json()
     except Exception as e:
         log_request(url, "REQUEST_ERROR", str(e))
         return None
 
-def safe_post_json(url: str, payload: Optional[dict] = None, params: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 60) -> Any:
-    try:
-        h = {
-            "User-Agent": "Mozilla/5.0 DevilPicksRealRail/4.0",
-            "Accept": "application/json,text/plain,*/*",
-            "Content-Type": "application/json",
-        }
-        if headers:
-            h.update(headers)
-        r = requests.post(url, json=payload or {}, params=params, headers=h, timeout=timeout)
-        if r.status_code not in [200, 201]:
-            log_request(url, f"HTTP {r.status_code}", r.text[:500])
-            return None
-        return r.json()
-    except Exception as e:
-        log_request(url, "POST_ERROR", str(e))
-        return None
-
 
 # ============================================================
-# SOURCE NORMALIZATION
+# UNDERDOG PARSER
 # ============================================================
 def normalize_prop_row(
-    source: str,
     player: Any,
     prop: Any,
     line: Any,
-    side: Any = "BOTH",
-    price: Any = DEFAULT_PRICE,
     team: Any = "",
     opponent: Any = "",
     game: Any = "",
     start_time: Any = "",
+    price: Any = DEFAULT_PRICE,
     raw: Optional[dict] = None,
 ) -> Optional[Dict[str, Any]]:
     prop_key = clean_prop_type(prop)
     if prop_key not in PROP_CONFIG:
         return None
+
     player = str(player or "").strip()
     if not player:
         return None
+
     line = safe_float(line)
     if line is None:
         return None
 
     return {
-        "source": str(source),
+        "source": "Underdog",
         "player": player,
         "team": str(team or "").strip(),
         "opponent": str(opponent or "").strip(),
@@ -400,25 +341,150 @@ def normalize_prop_row(
         "prop": prop_key,
         "prop_label": PROP_CONFIG[prop_key]["label"],
         "line": float(line),
-        "book_side": str(side or "BOTH").upper(),
         "price": float(safe_float(price, DEFAULT_PRICE)),
         "raw": raw or {},
     }
 
-
-# ============================================================
-# REAL SOURCE LOADERS
-# ============================================================
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_underdog_direct(enabled: bool, url: str) -> List[Dict[str, Any]]:
-    if not enabled:
-        return []
-    data = safe_get_json(url, timeout=25)
+def fetch_underdog_lines(url: str) -> List[Dict[str, Any]]:
+    """
+    Pull real Underdog lines only.
+
+    Primary endpoint:
+      https://api.underdogfantasy.com/beta/v5/over_under_lines
+
+    This function supports both current v5 top-level structure and older included/data shapes.
+    """
+    candidate_urls = []
+    if url:
+        candidate_urls.append(url)
+    for fallback in [
+        "https://api.underdogfantasy.com/beta/v5/over_under_lines",
+        "https://api.underdogfantasy.com/v5/over_under_lines",
+        "https://api.underdogfantasy.com/v1/over_under_lines",
+    ]:
+        if fallback not in candidate_urls:
+            candidate_urls.append(fallback)
+
+    data = None
+    used_url = ""
+    for u in candidate_urls:
+        data = safe_get_json(u, timeout=30)
+        if data:
+            used_url = u
+            break
+
     if not data:
+        log_request("Underdog", "NO_DATA", "All Underdog endpoints returned empty/blocked")
         return []
 
     rows: List[Dict[str, Any]] = []
 
+    # Current v5 shape: players, appearances, games, over_under_lines
+    if isinstance(data, dict) and isinstance(data.get("players"), list) and isinstance(data.get("appearances"), list):
+        players_raw = data.get("players", []) or []
+        appearances_raw = data.get("appearances", []) or []
+        lines_raw = data.get("over_under_lines", []) or []
+        games_raw = data.get("games", []) or []
+
+        players = {str(p.get("id")): p for p in players_raw if isinstance(p, dict)}
+        appearances = {str(a.get("id")): a for a in appearances_raw if isinstance(a, dict)}
+        games = {str(g.get("id")): g for g in games_raw if isinstance(g, dict)}
+
+        for line_item in lines_raw:
+            if not isinstance(line_item, dict):
+                continue
+
+            ou = line_item.get("over_under") if isinstance(line_item.get("over_under"), dict) else {}
+            app_stat = ou.get("appearance_stat") if isinstance(ou.get("appearance_stat"), dict) else {}
+
+            appearance_id = (
+                app_stat.get("appearance_id")
+                or line_item.get("appearance_id")
+                or line_item.get("appearanceId")
+            )
+            stat_name = (
+                app_stat.get("stat")
+                or app_stat.get("display_stat")
+                or line_item.get("stat")
+                or line_item.get("stat_type")
+                or line_item.get("display_stat")
+                or ou.get("title")
+            )
+            line_value = (
+                line_item.get("stat_value")
+                or line_item.get("line")
+                or line_item.get("value")
+                or ou.get("line")
+                or ou.get("stat_value")
+                or app_stat.get("value")
+            )
+
+            app = appearances.get(str(appearance_id), {}) if appearance_id is not None else {}
+            player_id = app.get("player_id") or app.get("playerId") or line_item.get("player_id")
+            player = players.get(str(player_id), {}) if player_id is not None else {}
+
+            first = player.get("first_name") or player.get("firstName") or ""
+            last = player.get("last_name") or player.get("lastName") or ""
+            player_name = (
+                player.get("full_name")
+                or player.get("fullName")
+                or player.get("display_name")
+                or app.get("player_name")
+                or f"{first} {last}".strip()
+            )
+
+            team = app.get("team_abbr") or app.get("team") or player.get("team") or player.get("team_abbr") or ""
+            opponent = app.get("opponent_abbr") or app.get("opponent") or ""
+            game_id = app.get("game_id") or app.get("match_id") or line_item.get("game_id") or ""
+            game_obj = games.get(str(game_id), {}) if game_id else {}
+            game = (
+                app.get("match_title")
+                or line_item.get("match_title")
+                or game_obj.get("title")
+                or (str(game_obj.get("away_team_name", "")) + (" @ " if game_obj else "") + str(game_obj.get("home_team_name", ""))).strip()
+            )
+            start_time = (
+                app.get("scheduled_at")
+                or app.get("start_time")
+                or game_obj.get("scheduled_at")
+                or game_obj.get("start_time")
+                or ""
+            )
+
+            option_price = DEFAULT_PRICE
+            options = line_item.get("options")
+            if isinstance(options, list) and options:
+                prices = []
+                for opt in options:
+                    if not isinstance(opt, dict):
+                        continue
+                    for key in ["american_odds", "americanOdds", "odds", "price"]:
+                        val = safe_float(opt.get(key))
+                        if val is not None:
+                            prices.append(val)
+                if prices:
+                    option_price = float(np.median(prices))
+
+            row = normalize_prop_row(
+                player=player_name,
+                prop=stat_name,
+                line=line_value,
+                team=team,
+                opponent=opponent,
+                game=game,
+                start_time=start_time,
+                price=option_price,
+                raw=line_item,
+            )
+            if row:
+                rows.append(row)
+
+        log_request("Underdog", "OK", f"{len(rows)} rows from {used_url}")
+        save_json(SNAPSHOT_FILE, {"created_at": now_iso(), "rows": rows})
+        return rows
+
+    # Older JSON/API fallback shape
     included = data.get("included", []) if isinstance(data, dict) else []
     data_items = data.get("data", []) if isinstance(data, dict) else data if isinstance(data, list) else []
     over_under_lines = data.get("over_under_lines", []) if isinstance(data, dict) else []
@@ -434,7 +500,7 @@ def fetch_underdog_direct(enabled: bool, url: str) -> List[Dict[str, Any]]:
         attrs = item.get("attributes", {}) or {}
         if "appearance" in typ:
             appearances[item_id] = attrs
-        if typ in ["player", "players"] or "player" in typ:
+        if "player" in typ:
             players[item_id] = attrs
 
     candidates = []
@@ -449,26 +515,22 @@ def fetch_underdog_direct(enabled: bool, url: str) -> List[Dict[str, Any]]:
 
         attrs = item.get("attributes", item) or {}
         rel = item.get("relationships", {}) or {}
-
-        # Underdog shape variants
         over_under = attrs.get("over_under") if isinstance(attrs.get("over_under"), dict) else {}
-        option = attrs.get("over_under_option") if isinstance(attrs.get("over_under_option"), dict) else {}
+        app_stat = over_under.get("appearance_stat") if isinstance(over_under.get("appearance_stat"), dict) else {}
 
         stat_type = (
             attrs.get("stat_type")
             or attrs.get("stat")
             or attrs.get("display_stat")
-            or attrs.get("title")
+            or app_stat.get("stat")
             or over_under.get("title")
-            or option.get("stat_type")
         )
-
         line = (
             attrs.get("line")
             or attrs.get("stat_value")
             or attrs.get("value")
             or over_under.get("line")
-            or option.get("line")
+            or over_under.get("stat_value")
         )
 
         appearance_id = None
@@ -476,11 +538,11 @@ def fetch_underdog_direct(enabled: bool, url: str) -> List[Dict[str, Any]]:
         try:
             appearance_id = rel.get("appearance", {}).get("data", {}).get("id")
         except Exception:
-            appearance_id = None
+            pass
         try:
             player_id = rel.get("player", {}).get("data", {}).get("id")
         except Exception:
-            player_id = None
+            pass
 
         app = appearances.get(str(appearance_id), {}) if appearance_id else {}
         pl = players.get(str(player_id), {}) if player_id else {}
@@ -492,207 +554,26 @@ def fetch_underdog_direct(enabled: bool, url: str) -> List[Dict[str, Any]]:
             or app.get("player_name")
             or app.get("name")
             or app.get("display_name")
-            or pl.get("first_name", "") + " " + pl.get("last_name", "")
-        ).strip()
-
-        team = attrs.get("team") or attrs.get("team_abbr") or app.get("team_abbr") or app.get("team") or ""
-        opp = attrs.get("opponent") or app.get("opponent_abbr") or app.get("opponent") or ""
-        game = attrs.get("match_title") or attrs.get("game") or app.get("match_title") or ""
-        start = attrs.get("scheduled_at") or attrs.get("start_time") or app.get("scheduled_at") or ""
+            or (str(pl.get("first_name", "")) + " " + str(pl.get("last_name", ""))).strip()
+        )
 
         row = normalize_prop_row(
-            "Underdog",
-            player_name,
-            stat_type,
-            line,
-            side="BOTH",
+            player=player_name,
+            prop=stat_type,
+            line=line,
+            team=attrs.get("team") or attrs.get("team_abbr") or app.get("team_abbr") or app.get("team") or "",
+            opponent=attrs.get("opponent") or app.get("opponent_abbr") or app.get("opponent") or "",
+            game=attrs.get("match_title") or attrs.get("game") or app.get("match_title") or "",
+            start_time=attrs.get("scheduled_at") or attrs.get("start_time") or app.get("scheduled_at") or "",
             price=DEFAULT_PRICE,
-            team=team,
-            opponent=opp,
-            game=game,
-            start_time=start,
             raw=attrs,
         )
         if row:
             rows.append(row)
 
-    log_request("Underdog Direct", "OK", f"{len(rows)} rows")
+    log_request("Underdog", "OK", f"{len(rows)} rows from {used_url} fallback parser")
+    save_json(SNAPSHOT_FILE, {"created_at": now_iso(), "rows": rows})
     return rows
-
-
-def apify_actor_url(actor_id: str) -> str:
-    actor = actor_id.replace("/", "~")
-    return f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_apify_actor(enabled: bool, actor_id: str, token: str, source_name: str, league: str) -> List[Dict[str, Any]]:
-    if not enabled or not token or not actor_id:
-        return []
-
-    url = apify_actor_url(actor_id)
-    params = {"token": token, "clean": "true"}
-    payload = {"league": league, "sport": "NBA", "sports": ["NBA"], "limit": 500}
-
-    data = safe_post_json(url, payload=payload, params=params, timeout=90)
-    if data is None:
-        # Some actors expose defaults via GET.
-        data = safe_get_json(url, params=params, timeout=90)
-
-    if not isinstance(data, list):
-        log_request(source_name, "NO_DATA", "Apify actor returned no list dataset")
-        return []
-
-    rows: List[Dict[str, Any]] = []
-
-    for it in data:
-        if not isinstance(it, dict):
-            continue
-        player = (
-            it.get("playerName")
-            or it.get("player_name")
-            or it.get("player")
-            or it.get("athlete")
-            or it.get("athleteName")
-            or it.get("name")
-        )
-        prop = it.get("statType") or it.get("stat_type") or it.get("market") or it.get("prop") or it.get("title")
-        line = it.get("line") or it.get("value") or it.get("statValue") or it.get("stat_value")
-        team = it.get("team") or it.get("teamAbbreviation") or it.get("team_abbr") or ""
-        opponent = it.get("opponent") or it.get("opponentAbbreviation") or it.get("opponent_abbr") or ""
-        game = it.get("game") or it.get("matchup") or it.get("matchTitle") or it.get("event") or ""
-        start_time = it.get("startTime") or it.get("start_time") or it.get("scheduledAt") or ""
-        side = it.get("side") or "BOTH"
-        price = it.get("americanOdds") or it.get("american_odds") or it.get("odds") or DEFAULT_PRICE
-
-        row = normalize_prop_row(
-            source_name,
-            player,
-            prop,
-            line,
-            side=side,
-            price=price,
-            team=team,
-            opponent=opponent,
-            game=game,
-            start_time=start_time,
-            raw=it,
-        )
-        if row:
-            rows.append(row)
-
-    log_request(source_name, "OK", f"{len(rows)} rows")
-    return rows
-
-
-@st.cache_data(ttl=360, show_spinner=False)
-def fetch_odds_api_props(enabled: bool, api_key: str, sport_key: str, selected_props: Tuple[str, ...]) -> List[Dict[str, Any]]:
-    if not enabled or not api_key:
-        return []
-
-    event_url = f"{ODDS_BASE}/sports/{sport_key}/events"
-    events = safe_get_json(event_url, params={"apiKey": api_key}, timeout=25)
-    if not isinstance(events, list):
-        return []
-
-    markets = sorted(set(PROP_CONFIG[p]["odds_market"] for p in selected_props if p in PROP_CONFIG))
-    if not markets:
-        return []
-
-    market_to_prop = {v["odds_market"]: k for k, v in PROP_CONFIG.items()}
-    rows: List[Dict[str, Any]] = []
-
-    for ev in events[:25]:
-        event_id = ev.get("id")
-        if not event_id:
-            continue
-
-        url = f"{ODDS_BASE}/sports/{sport_key}/events/{event_id}/odds"
-        data = safe_get_json(
-            url,
-            params={
-                "apiKey": api_key,
-                "regions": "us",
-                "markets": ",".join(markets),
-                "oddsFormat": "american",
-            },
-            timeout=25,
-        )
-        if not isinstance(data, dict):
-            continue
-
-        game = f"{ev.get('away_team','')} @ {ev.get('home_team','')}".strip(" @")
-        start_time = ev.get("commence_time") or ""
-
-        for book in data.get("bookmakers", []) or []:
-            book_name = book.get("title") or book.get("key") or "Book"
-            for market in book.get("markets", []) or []:
-                key = market.get("key")
-                prop_key = market_to_prop.get(key)
-                if not prop_key:
-                    continue
-                for out in market.get("outcomes", []) or []:
-                    player = out.get("description") or out.get("player") or out.get("participant") or ""
-                    side = out.get("name") or "BOTH"
-                    row = normalize_prop_row(
-                        f"OddsAPI/{book_name}",
-                        player,
-                        prop_key,
-                        out.get("point"),
-                        side=side,
-                        price=out.get("price", DEFAULT_PRICE),
-                        game=game,
-                        start_time=start_time,
-                        raw=out,
-                    )
-                    if row:
-                        rows.append(row)
-
-    log_request("OddsAPI", "OK", f"{len(rows)} rows")
-    return rows
-
-
-@st.cache_data(ttl=240, show_spinner=False)
-def get_all_source_props(
-    use_underdog: bool,
-    use_sleeper: bool,
-    use_odds_api: bool,
-    use_opticodds: bool,
-    underdog_url: str,
-    apify_token: str,
-    odds_api_key: str,
-    selected_props: Tuple[str, ...],
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-
-    rows.extend(fetch_underdog_direct(use_underdog, underdog_url))
-    rows.extend(fetch_apify_actor(use_underdog, APIFY_UNDERDOG_ACTOR, apify_token, "Underdog Apify", LEAGUE_FILTER))
-    rows.extend(fetch_apify_actor(use_sleeper, APIFY_SLEEPER_ACTOR, apify_token, "Sleeper", LEAGUE_FILTER))
-    rows.extend(fetch_odds_api_props(use_odds_api, odds_api_key, SPORT_KEY, selected_props))
-
-    # OpticOdds placeholder is intentionally not fake. It only logs that no configured parser is enabled.
-    if use_opticodds and OPTICODDS_API_KEY:
-        log_request("OpticOdds", "NOT_CONFIGURED", "OpticOdds parser not included in this build.")
-
-    # Deduplicate; keep first source row.
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for r in rows:
-        key = (
-            source_key(r["source"]),
-            normalize_name(r["player"]),
-            r["prop"],
-            round(float(r["line"]), 2),
-            r.get("book_side", "BOTH"),
-            r.get("game", ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(r)
-
-    save_json(SNAPSHOT_FILE, {"created_at": now_iso(), "rows": out})
-    return out
 
 
 # ============================================================
@@ -703,8 +584,6 @@ def load_learning() -> Dict[str, Any]:
         "samples": 0,
         "player_bias": {},
         "prop_bias": {},
-        "source_bias": {},
-        "model_calibration": {},
     })
 
 def save_learning(data: Dict[str, Any]) -> None:
@@ -712,13 +591,12 @@ def save_learning(data: Dict[str, Any]) -> None:
 
 def update_clv(row: Dict[str, Any], pick_side: str) -> float:
     data = load_json(CLV_FILE, {})
-    key = f"{source_key(row['source'])}_{normalize_name(row['player'])}_{row['prop']}_{pick_side}_{row['game']}"
+    key = f"{normalize_name(row['player'])}_{row['prop']}_{pick_side}_{row.get('game','')}"
     latest = float(row["line"])
     if key not in data:
         data[key] = {
             "open": latest,
             "latest": latest,
-            "source": row["source"],
             "player": row["player"],
             "prop": row["prop"],
             "side": pick_side,
@@ -727,6 +605,7 @@ def update_clv(row: Dict[str, Any], pick_side: str) -> float:
         }
         save_json(CLV_FILE, data)
         return 0.0
+
     open_val = safe_float(data[key].get("open"), latest) or latest
     data[key]["latest"] = latest
     data[key]["updated_at"] = now_iso()
@@ -735,57 +614,54 @@ def update_clv(row: Dict[str, Any], pick_side: str) -> float:
 
 def rebuild_learning_from_results() -> int:
     results = load_json(RESULT_LOG, [])
-    graded = [r for r in results if safe_float(r.get("actual")) is not None and safe_float(r.get("line")) is not None]
-    learning = load_learning()
+    graded = [
+        r for r in results
+        if safe_float(r.get("actual")) is not None and safe_float(r.get("line")) is not None
+    ]
 
-    player_bias = learning.get("player_bias") or {}
-    prop_bias = learning.get("prop_bias") or {}
-    source_bias = learning.get("source_bias") or {}
-
-    # Reset from scratch each rebuild for stability.
     player_bias = {}
     prop_bias = {}
-    source_bias = {}
 
     for r in graded[-600:]:
         actual = safe_float(r.get("actual"))
         line = safe_float(r.get("line"))
         if actual is None or line is None:
             continue
+
         err = clamp(actual - line, -10, 10)
         pkey = normalize_name(r.get("player"))
         prop = r.get("prop")
-        src = source_key(r.get("source", "Manual"))
 
         player_bias[pkey] = clamp((safe_float(player_bias.get(pkey), 0.0) or 0.0) + err * 0.004, -2.0, 2.0)
         prop_bias[prop] = clamp((safe_float(prop_bias.get(prop), 0.0) or 0.0) + err * 0.002, -1.25, 1.25)
-        source_bias[src] = clamp((safe_float(source_bias.get(src), 0.0) or 0.0) + err * 0.0012, -0.75, 0.75)
 
-    learning["samples"] = len(graded)
-    learning["player_bias"] = player_bias
-    learning["prop_bias"] = prop_bias
-    learning["source_bias"] = source_bias
-    learning["updated_at"] = now_iso()
+    learning = {
+        "samples": len(graded),
+        "player_bias": player_bias,
+        "prop_bias": prop_bias,
+        "updated_at": now_iso(),
+    }
     save_learning(learning)
     return len(graded)
 
 
 # ============================================================
-# MODEL LAYERS
+# MODEL
 # ============================================================
 def bayesian_shrink(prob: float, data_score: int, learning_samples: int, enabled: bool) -> Tuple[float, str]:
     if not enabled:
         return prob, "Bayesian off"
-    # Shrinks low-confidence picks toward 50/50.
+
     data_weight = clamp(data_score / 100.0, 0.30, 0.96)
     sample_weight = clamp(learning_samples / 100.0, 0.10, 1.00)
-    confidence = clamp((0.65 * data_weight) + (0.35 * sample_weight), 0.22, 0.94)
+    confidence = clamp((0.70 * data_weight) + (0.30 * sample_weight), 0.22, 0.94)
     adjusted = (prob * confidence) + (0.50 * (1 - confidence))
     return float(clamp(adjusted, 0.01, 0.99)), f"Bayesian confidence {confidence:.2f}"
 
 def markov_recent_state(player: str, prop: str, line: float, enabled: bool) -> Tuple[str, float]:
     if not enabled:
         return "off", 0.0
+
     results = load_json(RESULT_LOG, [])
     matches = [
         r for r in results
@@ -811,38 +687,21 @@ def markov_recent_state(player: str, prop: str, line: float, enabled: bool) -> T
         return "cold-over", -0.025
     return "stable", 0.0
 
-def projection_from_market_line(row: Dict[str, Any], learning: Dict[str, Any], use_learning: bool, use_markov: bool) -> Tuple[float, float, str, float, str]:
+def projection_from_line(row: Dict[str, Any], use_learning: bool, use_markov: bool) -> Tuple[float, float, str, float, str]:
+    learning = load_learning()
     line = float(row["line"])
     pkey = normalize_name(row["player"])
     prop = row["prop"]
-    src = source_key(row["source"])
 
     player_bias = safe_float((learning.get("player_bias") or {}).get(pkey), 0.0) or 0.0
     prop_bias = safe_float((learning.get("prop_bias") or {}).get(prop), 0.0) or 0.0
-    source_bias = safe_float((learning.get("source_bias") or {}).get(src), 0.0) or 0.0
+    bias = player_bias + prop_bias if use_learning else 0.0
 
-    bias = player_bias + prop_bias + source_bias if use_learning else 0.0
     projection = line + bias
     std = float(PROP_CONFIG[prop].get("std", 3.0))
-
     markov_state, markov_adj = markov_recent_state(row["player"], prop, line, use_markov)
-    note = f"Bias {bias:+.2f} | player {player_bias:+.2f}, prop {prop_bias:+.2f}, source {source_bias:+.2f}"
+    note = f"Bias {bias:+.2f} | player {player_bias:+.2f}, prop {prop_bias:+.2f}"
     return projection, std, markov_state, markov_adj, note
-
-def xgb_gate_score(features: Dict[str, Any], enabled: bool, learning_samples: int) -> Tuple[Optional[float], str]:
-    if not enabled:
-        return None, "XGBoost off"
-    if learning_samples < 75:
-        return None, "XGBoost waiting for 75+ graded samples"
-    if xgb is None and GradientBoostingClassifier is None:
-        return None, "XGBoost/GBM package unavailable"
-
-    # This build keeps a safe hook. It does not fabricate a trained model.
-    # After enough graded samples, you can train and persist a real model here.
-    state = load_json(MODEL_STATE_FILE, {})
-    if not state.get("trained"):
-        return None, "XGBoost hook ready, no trained model yet"
-    return None, "XGBoost model state not loaded in lightweight build"
 
 def model_one_prop(
     row: Dict[str, Any],
@@ -855,13 +714,12 @@ def model_one_prop(
     use_bayesian: bool,
     use_markov: bool,
     use_learning: bool,
-    use_xgboost: bool,
 ) -> Dict[str, Any]:
     learning = load_learning()
     learning_samples = int(learning.get("samples", 0) or 0)
 
-    projection, std, markov_state, markov_prob_adj, projection_note = projection_from_market_line(
-        row, learning, use_learning, use_markov
+    projection, std, markov_state, markov_prob_adj, projection_note = projection_from_line(
+        row, use_learning, use_markov
     )
 
     sims = np.random.normal(loc=projection, scale=max(std, 0.40), size=max(1000, sim_count))
@@ -874,11 +732,7 @@ def model_one_prop(
     side = "OVER" if over_raw >= under_raw else "UNDER"
     raw_pick_prob = max(over_raw, under_raw)
 
-    data_score = 50
-    if source_key(row["source"]) in ["Underdog", "Sleeper"]:
-        data_score += 12
-    elif source_key(row["source"]) == "OddsAPI":
-        data_score += 8
+    data_score = 64
     if row.get("player"):
         data_score += 7
     if row.get("game") or row.get("team"):
@@ -910,18 +764,6 @@ def model_one_prop(
     stake = bankroll * kelly
     clv = update_clv(row, side)
 
-    xgb_prob, xgb_note = xgb_gate_score(
-        {
-            "pick_prob": pick_prob,
-            "edge": edge,
-            "data_score": data_score,
-            "prop": row["prop"],
-            "source": source_key(row["source"]),
-        },
-        use_xgboost,
-        learning_samples,
-    )
-
     reasons = []
     if pick_prob < min_prob:
         reasons.append("probability below gate")
@@ -931,8 +773,6 @@ def model_one_prop(
         reasons.append("data score below gate")
     if ev is None or ev < 0:
         reasons.append("EV not positive")
-    if use_xgboost and xgb_prob is not None and xgb_prob < 0.53:
-        reasons.append("XGBoost filter failed")
 
     qualified = len(reasons) == 0
     if qualified and pick_prob >= 0.64 and edge >= min_edge * 1.25:
@@ -962,30 +802,28 @@ def model_one_prop(
         "signal": signal,
         "reasons": reasons,
         "markov_state": markov_state,
-        "model_notes": [projection_note, bayes_note, xgb_note],
+        "model_notes": [projection_note, bayes_note],
         "learning_samples": learning_samples,
     }
 
 def build_board(
     rows: List[Dict[str, Any]],
-    selected_sources: List[str],
     selected_props: List[str],
     player_search: str,
+    game_search: str,
     min_display_prob: float,
     show_passes: bool,
     **model_kwargs
 ) -> List[Dict[str, Any]]:
     filtered = []
-    source_set = set(selected_sources or [])
     prop_set = set(selected_props or [])
 
     for r in rows:
-        skey = source_key(r["source"])
-        if source_set and skey not in source_set and r["source"] not in source_set:
-            continue
         if prop_set and r["prop"] not in prop_set:
             continue
         if player_search and player_search.lower() not in r["player"].lower():
+            continue
+        if game_search and game_search.lower() not in str(r.get("game", "")).lower():
             continue
         filtered.append(r)
 
@@ -1007,12 +845,11 @@ def build_board(
 
 
 # ============================================================
-# OFFICIAL SNAPSHOTS / MANUAL GRADING
+# OFFICIAL PICKS / GRADING
 # ============================================================
 def official_pick_id(p: Dict[str, Any]) -> str:
     return (
-        f"{datetime.now().date()}_"
-        f"{source_key(p['source'])}_"
+        f"{datetime.now().date()}_underdog_"
         f"{normalize_name(p['player'])}_"
         f"{p['prop']}_{p['pick_side']}_{round(float(p['line']), 2)}_"
         f"{normalize_name(p.get('game',''))}"
@@ -1022,16 +859,19 @@ def save_official_picks(board: List[Dict[str, Any]], save_passes: bool = False) 
     picks = load_json(PICK_LOG, [])
     existing = set(p.get("pick_id") for p in picks)
     saved = 0
+
     for p in board:
         if p["signal"] == "PASS" and not save_passes:
             continue
+
         pid = official_pick_id(p)
         if pid in existing:
             continue
+
         picks.append({
             "pick_id": pid,
             "saved_at": now_iso(),
-            "source": p["source"],
+            "source": "Underdog",
             "player": p["player"],
             "team": p.get("team", ""),
             "opponent": p.get("opponent", ""),
@@ -1055,6 +895,7 @@ def save_official_picks(board: List[Dict[str, Any]], save_passes: bool = False) 
         })
         existing.add(pid)
         saved += 1
+
     save_json(PICK_LOG, picks)
     return saved
 
@@ -1070,14 +911,17 @@ def grade_saved_pick(pick_id: str, actual: float) -> bool:
         line = safe_float(p.get("line"))
         if line is None:
             continue
+
         side = p.get("side", "").upper()
         win = actual > line if side == "OVER" else actual < line
         p["graded"] = True
         p["actual"] = actual
         p["win"] = bool(win)
         p["graded_at"] = now_iso()
+
         if pick_id not in result_ids:
             results.append(dict(p))
+
         changed = True
         break
 
@@ -1085,6 +929,7 @@ def grade_saved_pick(pick_id: str, actual: float) -> bool:
         save_json(PICK_LOG, picks)
         save_json(RESULT_LOG, results)
         rebuild_learning_from_results()
+
     return changed
 
 def performance_summary() -> Dict[str, Any]:
@@ -1101,33 +946,26 @@ def performance_summary() -> Dict[str, Any]:
 
 
 # ============================================================
-# SIDEBAR CONTROLS
+# SIDEBAR
 # ============================================================
 with st.sidebar:
     st.markdown("""
     <div style='padding:8px 4px 12px 4px;'>
       <div style='font-size:28px;font-weight:950;'>😈 DEVIL PICKS</div>
-      <div style='color:#ff344f;font-weight:900;'>REAL RAIL PRO</div>
-      <div style='color:#aeb7c9;font-size:12px;margin-top:4px;'>Underdog • Sleeper • Odds API fallback</div>
+      <div style='color:#ff344f;font-weight:900;'>UNDERDOG ONLY</div>
+      <div style='color:#aeb7c9;font-size:12px;margin-top:4px;'>Real lines • no mixed feeds</div>
     </div>
     """, unsafe_allow_html=True)
-
-    st.markdown("### Source Toggles")
-    use_underdog = st.toggle("Underdog Direct + Apify", value=ENABLE_UNDERDOG_DEFAULT)
-    use_sleeper = st.toggle("Sleeper Apify", value=ENABLE_SLEEPER_DEFAULT)
-    use_odds_api = st.toggle("Odds API fallback", value=ENABLE_ODDS_API_DEFAULT)
-    use_opticodds = st.toggle("OpticOdds placeholder", value=ENABLE_OPTICODDS_DEFAULT)
 
     st.markdown("### Model Toggles")
     use_bayesian = st.toggle("Bayesian confidence", value=os.getenv("ENABLE_BAYESIAN", "true").lower() == "true")
     use_markov = st.toggle("Markov recent form", value=os.getenv("ENABLE_MARKOV", "true").lower() == "true")
     use_learning = st.toggle("Use saved learning", value=os.getenv("ENABLE_LEARNING", "true").lower() == "true")
-    use_xgboost = st.toggle("XGBoost/GBM filter", value=os.getenv("ENABLE_XGBOOST", "false").lower() == "true")
 
     st.markdown("### Board Filters")
     selected_props = st.multiselect("Props", list(PROP_CONFIG.keys()), default=list(PROP_CONFIG.keys()))
-    selected_sources = st.multiselect("Sources", ["Underdog", "Underdog Apify", "Sleeper", "OddsAPI"], default=["Underdog", "Underdog Apify", "Sleeper", "OddsAPI"])
     player_search = st.text_input("Search player", "")
+    game_search = st.text_input("Search game", "")
 
     st.markdown("### Gates")
     bankroll = st.number_input("Bankroll", min_value=10.0, value=DEFAULT_BANKROLL, step=25.0)
@@ -1139,19 +977,18 @@ with st.sidebar:
     max_kelly = st.slider("Max Kelly stake", 0.0, 0.10, DEFAULT_MAX_KELLY, 0.005)
     show_passes = st.toggle("Show PASS rows", value=True)
 
-    st.markdown("### Key Status")
-    st.write("APIFY_TOKEN:", "✅ set" if APIFY_TOKEN else "❌ missing")
-    st.write("ODDS_API_KEY:", "✅ set" if ODDS_API_KEY else "not set")
-    st.write("Underdog URL:", UNDERDOG_API_URL[:42] + ("..." if len(UNDERDOG_API_URL) > 42 else ""))
+    st.markdown("### Source")
+    st.write("Source: ✅ Underdog only")
+    st.write("Endpoint:", UNDERDOG_API_URL[:42] + ("..." if len(UNDERDOG_API_URL) > 42 else ""))
 
 
 # ============================================================
-# MAIN APP
+# MAIN UI
 # ============================================================
 st.markdown("""
 <div class='hero'>
-  <div class='logo-title'>😈 DEVIL PICKS — Real Rail Pro</div>
-  <div class='sub'>Real prop board • Underdog/Sleeper source toggles • Bayesian + Markov + Monte Carlo • official snapshots • manual grading + learning</div>
+  <div class='logo-title'>😈 DEVIL PICKS — Underdog Only Rail</div>
+  <div class='sub'>Real Underdog lines only • Monte Carlo • Bayesian confidence • Markov tracking • save/grade/learn</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1160,7 +997,7 @@ learn = load_learning()
 
 top_cols = st.columns(5)
 with top_cols[0]:
-    refresh = st.button("🔄 Refresh Live Board", use_container_width=True)
+    refresh = st.button("🔄 Refresh Underdog Lines", use_container_width=True)
 with top_cols[1]:
     save_btn = st.button("💾 Save Official Picks", use_container_width=True)
 with top_cols[2]:
@@ -1168,39 +1005,28 @@ with top_cols[2]:
 with top_cols[3]:
     rebuild_btn = st.button("🧠 Rebuild Learning", use_container_width=True)
 with top_cols[4]:
-    export_btn = st.button("📤 Export Snapshot", use_container_width=True)
+    export_btn = st.button("📤 Export CSV", use_container_width=True)
 
 if clear_cache:
     st.cache_data.clear()
-    st.success("Cache cleared. Click Refresh Live Board.")
+    st.success("Cache cleared. Click Refresh Underdog Lines.")
 
 if rebuild_btn:
     n = rebuild_learning_from_results()
     st.success(f"Learning rebuilt from {n} graded results.")
 
-selected_props_tuple = tuple(selected_props)
-
-if refresh or "source_rows" not in st.session_state:
-    with st.spinner("Pulling real source props..."):
-        st.session_state["source_rows"] = get_all_source_props(
-            use_underdog,
-            use_sleeper,
-            use_odds_api,
-            use_opticodds,
-            UNDERDOG_API_URL,
-            APIFY_TOKEN,
-            ODDS_API_KEY,
-            selected_props_tuple,
-        )
+if refresh or "underdog_rows" not in st.session_state:
+    with st.spinner("Pulling real Underdog lines..."):
+        st.session_state["underdog_rows"] = fetch_underdog_lines(UNDERDOG_API_URL)
         st.session_state["last_refresh"] = now_iso()
 
-source_rows = st.session_state.get("source_rows", [])
+source_rows = st.session_state.get("underdog_rows", [])
 
 board = build_board(
     source_rows,
-    selected_sources=selected_sources,
     selected_props=selected_props,
     player_search=player_search,
+    game_search=game_search,
     min_display_prob=min_display_prob,
     show_passes=show_passes,
     sim_count=sim_count,
@@ -1212,28 +1038,27 @@ board = build_board(
     use_bayesian=use_bayesian,
     use_markov=use_markov,
     use_learning=use_learning,
-    use_xgboost=use_xgboost,
 )
 
 if save_btn:
     saved = save_official_picks(board)
-    st.success(f"Saved {saved} official picks.")
+    st.success(f"Saved {saved} official Underdog picks.")
 
 if export_btn:
-    export_path = os.path.join(DATA_DIR, "export_board.csv")
     if board:
-        pd.DataFrame(board).drop(columns=["raw"], errors="ignore").to_csv(export_path, index=False)
-        st.success(f"Exported board to {export_path}")
+        export_df = pd.DataFrame(board).drop(columns=["raw"], errors="ignore")
+        csv = export_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download current board CSV", csv, file_name="underdog_board.csv", mime="text/csv")
     else:
         st.warning("No board rows to export.")
 
 qualified = [b for b in board if b.get("qualified")]
 strong = [b for b in qualified if "STRONG" in b.get("signal", "")]
-source_counts = pd.Series([source_key(r["source"]) for r in source_rows]).value_counts().to_dict() if source_rows else {}
+prop_counts = pd.Series([r["prop"] for r in source_rows]).value_counts().to_dict() if source_rows else {}
 
 st.markdown(f"""
 <div class='metric-grid'>
-  <div class='metric-box'><div class='metric-label'>Source Rows</div><div class='metric-value'>{len(source_rows)}</div><div class='metric-sub'>{source_counts}</div></div>
+  <div class='metric-box'><div class='metric-label'>Underdog Rows</div><div class='metric-value'>{len(source_rows)}</div><div class='metric-sub'>{prop_counts}</div></div>
   <div class='metric-box'><div class='metric-label'>Board Rows</div><div class='metric-value'>{len(board)}</div><div class='metric-sub'>After filters</div></div>
   <div class='metric-box'><div class='metric-label'>Official Plays</div><div class='metric-value'>{len(qualified)}</div><div class='metric-sub'>Gate passed</div></div>
   <div class='metric-box'><div class='metric-label'>Strong Plays</div><div class='metric-value'>{len(strong)}</div><div class='metric-sub'>High confidence</div></div>
@@ -1244,11 +1069,11 @@ st.markdown(f"""
 if not source_rows:
     st.markdown("""
     <div class='card card-bad'>
-      <div class='big'>No real source rows loaded</div>
+      <div class='big'>No Underdog lines loaded</div>
       <div class='sub'>
-        This build does not create fake props. Check source toggles and Railway environment variables.
-        Underdog direct may need UNDERDOG_API_URL override if their feed changed.
-        Sleeper requires APIFY_TOKEN or another enabled feed because Sleeper does not expose a stable public Picks prop-line API in this app.
+        This app does not create fake props. Open Source Logs to see the request status.
+        If Railway is blocked or Underdog changes the feed, set UNDERDOG_API_URL in Railway.
+        Then click Clear Cache and Refresh Underdog Lines.
       </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1256,30 +1081,29 @@ if not source_rows:
 tabs = st.tabs([
     "😈 Top Plays",
     "📋 Full Board",
-    "🔎 Source Rows",
+    "🔎 Raw Underdog Lines",
     "💾 Official Picks",
     "✅ Grade + Learn",
     "📈 Performance",
     "🔌 Source Logs",
-    "⚙️ Deployment",
+    "⚙️ Railway Setup",
 ])
 
 with tabs[0]:
-    st.markdown("<div class='section-title'>Top Real Plays</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>Top Underdog Plays</div>", unsafe_allow_html=True)
     if not board:
         st.info("No board rows after filters.")
-    for p in board[:50]:
+    for p in board[:60]:
         card_class = "card card-good" if p["qualified"] else "card card-warn"
         reason_text = ", ".join(p["reasons"]) if p["reasons"] else "gates passed"
         notes = " • ".join(p.get("model_notes", []))
         st.markdown(f"""
         <div class='{card_class}'>
           <div class='big'>{p['player']} — {p['prop_label']}</div>
-          <span class='badge badge-blue'>{p['source']}</span>
+          <span class='badge badge-blue'>Underdog</span>
           <span class='badge {'badge-green' if p['qualified'] else 'badge-orange'}'>{p['signal']}</span>
           <span class='badge'>Pick: {p['pick_side']}</span>
           <span class='badge'>Line: {p['line']}</span>
-          <span class='badge'>Price: {odds_display(p['price'])}</span>
           <span class='badge'>State: {p['markov_state']}</span>
           <div class='metric-grid'>
             <div class='metric-box'><div class='metric-label'>Projection</div><div class='metric-value'>{p['projection']:.2f}</div><div class='metric-sub'>Edge {p['edge']:+.2f}</div></div>
@@ -1296,14 +1120,12 @@ with tabs[0]:
 with tabs[1]:
     if board:
         display_cols = [
-            "signal", "source", "player", "team", "game", "prop", "line", "pick_side",
+            "signal", "player", "team", "game", "prop", "line", "pick_side",
             "projection", "over_prob", "under_prob", "pick_prob", "edge", "ev",
             "kelly", "stake", "clv", "data_score", "markov_state", "reasons",
         ]
         df = pd.DataFrame(board).drop(columns=["raw"], errors="ignore")
         st.dataframe(df[[c for c in display_cols if c in df.columns]], use_container_width=True, hide_index=True)
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("Download current board CSV", csv, file_name="devil_picks_board.csv", mime="text/csv")
     else:
         st.info("No board rows.")
 
@@ -1312,7 +1134,7 @@ with tabs[2]:
         raw_df = pd.DataFrame(source_rows).drop(columns=["raw"], errors="ignore")
         st.dataframe(raw_df, use_container_width=True, hide_index=True)
     else:
-        st.info("No source rows loaded.")
+        st.info("No raw Underdog lines loaded.")
 
 with tabs[3]:
     picks = load_json(PICK_LOG, [])
@@ -1325,11 +1147,12 @@ with tabs[4]:
     st.markdown("<div class='section-title'>Manual Grading</div>", unsafe_allow_html=True)
     picks = load_json(PICK_LOG, [])
     ungraded = [p for p in picks if not p.get("graded")]
+
     if not ungraded:
         st.info("No ungraded official picks.")
     else:
         pick_labels = [
-            f"{p['player']} {p['prop']} {p['side']} {p['line']} | {p['source']} | {p.get('game','')}"
+            f"{p['player']} {p['prop']} {p['side']} {p['line']} | {p.get('game','')}"
             for p in ungraded
         ]
         idx = st.selectbox("Pick to grade", range(len(ungraded)), format_func=lambda i: pick_labels[i])
@@ -1352,7 +1175,6 @@ with tabs[4]:
             m_line = st.number_input("Line", value=0.0, step=0.5)
         with c4:
             m_actual = st.number_input("Actual", value=0.0, step=0.5)
-        m_source = st.text_input("Source", value="Manual")
         submitted = st.form_submit_button("Add Manual Result + Rebuild Learning")
         if submitted and m_player:
             results = load_json(RESULT_LOG, [])
@@ -1360,7 +1182,7 @@ with tabs[4]:
             results.append({
                 "pick_id": f"manual_{now_iso()}_{normalize_name(m_player)}_{m_prop}",
                 "saved_at": now_iso(),
-                "source": m_source,
+                "source": "Underdog Manual",
                 "player": m_player,
                 "prop": m_prop,
                 "prop_label": PROP_CONFIG[m_prop]["label"],
@@ -1413,34 +1235,17 @@ with tabs[6]:
 
 with tabs[7]:
     st.markdown("""
-    ### Railway Environment Variables
+    ### Railway setup
 
-    Minimum for Underdog direct:
-    ```text
-    ENABLE_UNDERDOG=true
-    ENABLE_SLEEPER=false
-    ENABLE_ODDS_API=false
-    ```
+    This Underdog-only build does not require `ODDS_API_KEY` or `APIFY_TOKEN`.
 
-    For Underdog + Sleeper through Apify:
-    ```text
-    APIFY_TOKEN=your_apify_token
-    ENABLE_UNDERDOG=true
-    ENABLE_SLEEPER=true
-    ```
+    Optional environment variables:
 
-    Optional Odds API fallback:
     ```text
-    ODDS_API_KEY=your_odds_api_key
-    ENABLE_ODDS_API=true
-    ```
-
-    Optional model controls:
-    ```text
+    UNDERDOG_API_URL=https://api.underdogfantasy.com/beta/v5/over_under_lines
     ENABLE_BAYESIAN=true
     ENABLE_MARKOV=true
     ENABLE_LEARNING=true
-    ENABLE_XGBOOST=false
     PROP_SIMULATION_COUNT=12000
     MIN_PROB=0.57
     MIN_DATA_SCORE=68
@@ -1448,4 +1253,11 @@ with tabs[7]:
     ```
 
     Railway start command is handled by the included `Procfile`.
+
+    If props do not show:
+    1. Click **Clear Cache**
+    2. Click **Refresh Underdog Lines**
+    3. Open **Source Logs**
+    4. If the endpoint is blocked or changed, update `UNDERDOG_API_URL`
     """)
+
