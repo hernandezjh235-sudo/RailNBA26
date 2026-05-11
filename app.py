@@ -60,7 +60,13 @@ UNDERDOG_API_URL = os.getenv(
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
 ).strip()
 
+NBA_PLAYER_INDEX = "https://stats.nba.com/stats/playerindex"
+NBA_PLAYER_GAMELOG = "https://stats.nba.com/stats/playergamelog"
+
 DEFAULT_PRICE = float(os.getenv("DEFAULT_PRICE", "-110"))
+# Underdog pick'em is not standard sportsbook -110 pricing. This EV uses a configurable
+# fair-price proxy so the EV column is useful. Set DEFAULT_PRICE/EV_PRICE in Railway if desired.
+EV_PRICE = float(os.getenv("EV_PRICE", os.getenv("DEFAULT_PRICE", "-110")))
 DEFAULT_SIM_COUNT = int(os.getenv("PROP_SIMULATION_COUNT", "12000"))
 DEFAULT_MIN_PROB = float(os.getenv("MIN_PROB", "0.57"))
 DEFAULT_MIN_DATA_SCORE = int(os.getenv("MIN_DATA_SCORE", "68"))
@@ -273,11 +279,37 @@ def american_to_decimal(odds: Any) -> Optional[float]:
         return None
     return 1 + odds / 100 if odds > 0 else 1 + 100 / abs(odds)
 
-def expected_value(prob: Optional[float], odds: Any = DEFAULT_PRICE) -> Optional[float]:
+def expected_value(prob: Optional[float], odds: Any = EV_PRICE) -> Optional[float]:
+    """
+    EV per 1 unit risked using an American-odds proxy.
+    For Underdog, this is a modeling proxy, not an official sportsbook price.
+    """
     dec = american_to_decimal(odds)
     if prob is None or dec is None:
         return None
     return float(prob * (dec - 1) - (1 - prob))
+
+def edge_metrics(projection: float, line: float, side: str, over_prob: float, under_prob: float) -> Dict[str, float]:
+    """
+    Direction-aware edge:
+    - raw_edge = projection - line
+    - pick_edge = positive amount supporting the selected side
+      OVER: projection - line
+      UNDER: line - projection
+    - edge_pct = pick_edge / line when possible
+    """
+    raw_edge = float(projection) - float(line)
+    side = str(side).upper()
+    pick_edge = raw_edge if side == "OVER" else -raw_edge
+    line_abs = abs(float(line)) if abs(float(line)) > 0 else 1.0
+    edge_pct = pick_edge / line_abs
+    prob_edge = max(float(over_prob), float(under_prob)) - 0.50
+    return {
+        "raw_edge": float(raw_edge),
+        "pick_edge": float(pick_edge),
+        "edge_pct": float(edge_pct),
+        "prob_edge": float(prob_edge),
+    }
 
 def kelly_fraction(prob: Optional[float], odds: Any, max_kelly: float) -> float:
     dec = american_to_decimal(odds)
@@ -301,6 +333,48 @@ def pct(x: Optional[float]) -> str:
     return f"{x * 100:.1f}%"
 
 
+def current_nba_season() -> str:
+    """
+    NBA season string used by stats.nba.com.
+    Example: before July 2026 returns 2025-26; after July returns 2026-27.
+    """
+    now = datetime.now(local_tz()) if "local_tz" in globals() else datetime.now()
+    y = now.year
+    if now.month < 7:
+        start = y - 1
+    else:
+        start = y
+    return f"{start}-{str(start + 1)[-2:]}"
+
+def stat_prop_value_from_log_row(row: Dict[str, Any], prop: str) -> float:
+    def sf(k):
+        return safe_float(row.get(k), 0.0) or 0.0
+    if prop == "PTS":
+        return sf("PTS")
+    if prop == "REB":
+        return sf("REB")
+    if prop == "AST":
+        return sf("AST")
+    if prop == "PRA":
+        return sf("PTS") + sf("REB") + sf("AST")
+    if prop == "PR":
+        return sf("PTS") + sf("REB")
+    if prop == "PA":
+        return sf("PTS") + sf("AST")
+    if prop == "RA":
+        return sf("REB") + sf("AST")
+    if prop == "3PM":
+        return sf("FG3M")
+    if prop == "BLK":
+        return sf("BLK")
+    if prop == "STL":
+        return sf("STL")
+    if prop == "TO":
+        return sf("TOV")
+    return 0.0
+
+
+
 # ============================================================
 # HTTP
 # ============================================================
@@ -322,6 +396,175 @@ def safe_get_json(url: str, timeout: int = 30) -> Any:
     except Exception as e:
         log_request(url, "REQUEST_ERROR", str(e))
         return None
+
+
+def safe_get_nba_json(url: str, params: Optional[dict] = None, timeout: int = 25) -> Any:
+    try:
+        headers = {
+            "Host": "stats.nba.com",
+            "Connection": "keep-alive",
+            "Accept": "application/json, text/plain, */*",
+            "x-nba-stats-token": "true",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "x-nba-stats-origin": "stats",
+            "Origin": "https://www.nba.com",
+            "Referer": "https://www.nba.com/",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            log_request(url, f"NBA_HTTP {r.status_code}", r.text[:400])
+            return None
+        return r.json()
+    except Exception as e:
+        log_request(url, "NBA_REQUEST_ERROR", str(e))
+        return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_nba_player_index(season: str) -> List[Dict[str, Any]]:
+    params = {
+        "College": "",
+        "Country": "",
+        "DraftPick": "",
+        "DraftRound": "",
+        "DraftYear": "",
+        "Height": "",
+        "Historical": "0",
+        "LeagueID": "00",
+        "Season": season,
+        "SeasonType": "Regular Season",
+        "TeamID": "0",
+        "Weight": "",
+    }
+    data = safe_get_nba_json(NBA_PLAYER_INDEX, params=params, timeout=25)
+    rows = []
+    try:
+        rs = data.get("resultSets", [])[0]
+        headers = rs.get("headers", [])
+        for r in rs.get("rowSet", []):
+            d = dict(zip(headers, r))
+            rows.append(d)
+    except Exception as e:
+        log_request("NBA_PLAYER_INDEX", "PARSE_ERROR", str(e))
+    return rows
+
+def best_nba_player_match(name: str, season: str) -> Tuple[Optional[int], float, str]:
+    players = get_nba_player_index(season)
+    best_id, best_score, best_name = None, 0.0, ""
+    target = normalize_name(name)
+    for p in players:
+        cand = (
+            p.get("PLAYER_NAME")
+            or p.get("PLAYER")
+            or p.get("DISPLAY_FIRST_LAST")
+            or p.get("PLAYER_SLUG")
+            or ""
+        )
+        score = difflib.SequenceMatcher(None, target, normalize_name(cand)).ratio()
+        if target and (target in normalize_name(cand) or normalize_name(cand) in target):
+            score = max(score, 0.94)
+        if score > best_score:
+            best_score = score
+            best_id = safe_int(p.get("PERSON_ID") or p.get("PLAYER_ID"))
+            best_name = str(cand)
+    return best_id, float(best_score), best_name
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_nba_player_gamelog(player_id: int, season: str) -> pd.DataFrame:
+    params = {
+        "PlayerID": str(player_id),
+        "Season": season,
+        "SeasonType": "Regular Season",
+        "LeagueID": "00",
+    }
+    data = safe_get_nba_json(NBA_PLAYER_GAMELOG, params=params, timeout=25)
+    try:
+        rs = data.get("resultSets", [])[0]
+        headers = rs.get("headers", [])
+        df = pd.DataFrame(rs.get("rowSet", []), columns=headers)
+        for c in ["PTS", "REB", "AST", "FG3M", "BLK", "STL", "TOV", "MIN"]:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df
+    except Exception as e:
+        log_request("NBA_PLAYER_GAMELOG", "PARSE_ERROR", str(e))
+        return pd.DataFrame()
+
+def true_stat_projection(player_name: str, prop: str, line: float, use_real_stats: bool, season: str) -> Dict[str, Any]:
+    """
+    Builds an actual player projection from NBA game logs.
+    If stats are unavailable, returns a market fallback and flags it clearly.
+    """
+    fallback = {
+        "projection": float(line),
+        "std": float(PROP_CONFIG[prop].get("std", 3.0)),
+        "source": "market_fallback",
+        "note": "No NBA log projection available; using line as fallback",
+        "nba_player_id": None,
+        "nba_match_score": 0.0,
+        "nba_match_name": "",
+        "l3": None, "l5": None, "l10": None, "season_avg": None, "minutes": None,
+    }
+    if not use_real_stats:
+        fallback["note"] = "Real NBA stats toggle off; using line fallback"
+        return fallback
+
+    pid, score, match_name = best_nba_player_match(player_name, season)
+    if not pid or score < 0.78:
+        fallback["note"] = f"NBA player match not strong enough ({score:.2f}); using line fallback"
+        fallback["nba_match_score"] = score
+        fallback["nba_match_name"] = match_name
+        return fallback
+
+    logs = get_nba_player_gamelog(pid, season)
+    if logs.empty:
+        fallback["note"] = "NBA game logs empty; using line fallback"
+        fallback["nba_player_id"] = pid
+        fallback["nba_match_score"] = score
+        fallback["nba_match_name"] = match_name
+        return fallback
+
+    values = []
+    for _, r in logs.head(15).iterrows():
+        values.append(stat_prop_value_from_log_row(r.to_dict(), prop))
+    values = [float(v) for v in values if v is not None]
+    if not values:
+        fallback["note"] = "NBA values empty; using line fallback"
+        fallback["nba_player_id"] = pid
+        fallback["nba_match_score"] = score
+        fallback["nba_match_name"] = match_name
+        return fallback
+
+    l3 = float(np.mean(values[:3])) if len(values) >= 3 else float(np.mean(values))
+    l5 = float(np.mean(values[:5])) if len(values) >= 5 else float(np.mean(values))
+    l10 = float(np.mean(values[:10])) if len(values) >= 10 else float(np.mean(values))
+    season_avg = float(np.mean(values))
+    minutes = float(pd.to_numeric(logs.head(5)["MIN"], errors="coerce").mean()) if "MIN" in logs.columns else None
+
+    # Weighted real projection, not just the Underdog line.
+    projection = (l3 * 0.30) + (l5 * 0.25) + (l10 * 0.25) + (season_avg * 0.20)
+
+    if minutes is not None:
+        if minutes < 18:
+            projection *= 0.90
+        elif minutes > 34:
+            projection *= 1.03
+
+    recent_vals = values[:10]
+    std = float(np.std(recent_vals)) if len(recent_vals) >= 3 else float(PROP_CONFIG[prop].get("std", 3.0))
+    std = max(std, float(PROP_CONFIG[prop].get("std", 3.0)) * 0.55, 0.45)
+
+    return {
+        "projection": float(projection),
+        "std": float(std),
+        "source": "nba_gamelog",
+        "note": f"NBA logs: L3 {l3:.2f}, L5 {l5:.2f}, L10 {l10:.2f}, season {season_avg:.2f}",
+        "nba_player_id": pid,
+        "nba_match_score": score,
+        "nba_match_name": match_name,
+        "l3": l3, "l5": l5, "l10": l10, "season_avg": season_avg, "minutes": minutes,
+    }
+
 
 
 
@@ -976,21 +1219,39 @@ def markov_recent_state(player: str, prop: str, line: float, enabled: bool) -> T
         return "cold-over", -0.025
     return "stable", 0.0
 
-def projection_from_line(row: Dict[str, Any], use_learning: bool, use_markov: bool) -> Tuple[float, float, str, float, str]:
+def projection_from_line(
+    row: Dict[str, Any],
+    use_learning: bool,
+    use_markov: bool,
+    use_real_stats: bool,
+    nba_season: str,
+    market_blend: float,
+) -> Tuple[float, float, str, float, str, Dict[str, Any]]:
     learning = load_learning()
     line = float(row["line"])
     pkey = normalize_name(row["player"])
     prop = row["prop"]
 
+    real = true_stat_projection(row["player"], prop, line, use_real_stats, nba_season)
+
     player_bias = safe_float((learning.get("player_bias") or {}).get(pkey), 0.0) or 0.0
     prop_bias = safe_float((learning.get("prop_bias") or {}).get(prop), 0.0) or 0.0
     bias = player_bias + prop_bias if use_learning else 0.0
 
-    projection = line + bias
-    std = float(PROP_CONFIG[prop].get("std", 3.0))
+    # Blend real stat projection with market line only for stability.
+    # 0.0 = pure stats, 1.0 = pure market line.
+    market_blend = clamp(float(market_blend), 0.0, 0.85)
+    projection = (real["projection"] * (1.0 - market_blend)) + (line * market_blend) + bias
+    std = float(real["std"])
+
     markov_state, markov_adj = markov_recent_state(row["player"], prop, line, use_markov)
-    note = f"Bias {bias:+.2f} | player {player_bias:+.2f}, prop {prop_bias:+.2f}"
-    return projection, std, markov_state, markov_adj, note
+
+    diff = projection - line
+    note = (
+        f"Projection source: {real['source']} | {real['note']} | "
+        f"market blend {market_blend:.2f} | bias {bias:+.2f} | diff vs line {diff:+.2f}"
+    )
+    return projection, std, markov_state, markov_adj, note, real
 
 def model_one_prop(
     row: Dict[str, Any],
@@ -1003,12 +1264,15 @@ def model_one_prop(
     use_bayesian: bool,
     use_markov: bool,
     use_learning: bool,
+    use_real_stats: bool,
+    nba_season: str,
+    market_blend: float,
 ) -> Dict[str, Any]:
     learning = load_learning()
     learning_samples = int(learning.get("samples", 0) or 0)
 
-    projection, std, markov_state, markov_prob_adj, projection_note = projection_from_line(
-        row, use_learning, use_markov
+    projection, std, markov_state, markov_prob_adj, projection_note, real_projection_meta = projection_from_line(
+        row, use_learning, use_markov, use_real_stats, nba_season, market_blend
     )
 
     sims = np.random.normal(loc=projection, scale=max(std, 0.40), size=max(1000, sim_count))
@@ -1045,19 +1309,28 @@ def model_one_prop(
         over_prob = 1.0 - adj_prob
 
     pick_prob = max(over_prob, under_prob)
-    edge = abs(float(projection) - float(row["line"]))
+
+    edges = edge_metrics(projection, float(row["line"]), side, over_prob, under_prob)
+    raw_edge = edges["raw_edge"]
+    pick_edge = edges["pick_edge"]
+    edge_pct = edges["edge_pct"]
+    prob_edge = edges["prob_edge"]
+
+    # Backward-compatible absolute edge plus direction-aware edge.
+    edge = abs(raw_edge)
     min_edge = float(PROP_CONFIG[row["prop"]]["min_edge"]) * min_edge_scale
 
-    ev = expected_value(pick_prob, row.get("price", DEFAULT_PRICE))
-    kelly = kelly_fraction(pick_prob, row.get("price", DEFAULT_PRICE), max_kelly)
+    # Use EV_PRICE proxy because Underdog lines do not expose standard single-pick odds.
+    ev = expected_value(pick_prob, EV_PRICE)
+    kelly = kelly_fraction(pick_prob, EV_PRICE, max_kelly)
     stake = bankroll * kelly
     clv = update_clv(row, side)
 
     reasons = []
     if pick_prob < min_prob:
         reasons.append("probability below gate")
-    if edge < min_edge:
-        reasons.append("edge below gate")
+    if pick_edge < min_edge:
+        reasons.append("directional edge below gate")
     if data_score < min_data_score:
         reasons.append("data score below gate")
     if ev is None or ev < 0:
@@ -1081,8 +1354,13 @@ def model_one_prop(
         "pick_prob": float(pick_prob),
         "raw_pick_prob": float(raw_pick_prob),
         "edge": float(edge),
+        "raw_edge": float(raw_edge),
+        "pick_edge": float(pick_edge),
+        "edge_pct": float(edge_pct),
+        "prob_edge": float(prob_edge),
         "min_edge": float(min_edge),
         "ev": None if ev is None else float(ev),
+        "ev_price": float(EV_PRICE),
         "kelly": float(kelly),
         "stake": float(stake),
         "clv": float(clv),
@@ -1093,6 +1371,15 @@ def model_one_prop(
         "markov_state": markov_state,
         "model_notes": [projection_note, bayes_note],
         "learning_samples": learning_samples,
+        "projection_source": real_projection_meta.get("source"),
+        "nba_player_id": real_projection_meta.get("nba_player_id"),
+        "nba_match_score": real_projection_meta.get("nba_match_score"),
+        "nba_match_name": real_projection_meta.get("nba_match_name"),
+        "l3": real_projection_meta.get("l3"),
+        "l5": real_projection_meta.get("l5"),
+        "l10": real_projection_meta.get("l10"),
+        "season_avg": real_projection_meta.get("season_avg"),
+        "minutes": real_projection_meta.get("minutes"),
     }
 
 def build_board(
@@ -1127,7 +1414,7 @@ def build_board(
         not x["qualified"],
         -(x["ev"] if x["ev"] is not None else -9),
         -x["pick_prob"],
-        -x["edge"],
+        -x.get("pick_edge", x.get("edge", 0)),
         -x["data_score"],
     ))
     return board
@@ -1174,7 +1461,12 @@ def save_official_picks(board: List[Dict[str, Any]], save_passes: bool = False) 
             "projection": round(float(p["projection"]), 3),
             "pick_prob": round(float(p["pick_prob"]), 4),
             "edge": round(float(p["edge"]), 3),
+            "raw_edge": round(float(p.get("raw_edge", 0)), 3),
+            "pick_edge": round(float(p.get("pick_edge", 0)), 3),
+            "edge_pct": round(float(p.get("edge_pct", 0)), 4),
+            "prob_edge": round(float(p.get("prob_edge", 0)), 4),
             "ev": None if p["ev"] is None else round(float(p["ev"]), 4),
+            "ev_price": p.get("ev_price", EV_PRICE),
             "kelly": round(float(p["kelly"]), 4),
             "stake": round(float(p["stake"]), 2),
             "signal": p["signal"],
@@ -1250,6 +1542,9 @@ with st.sidebar:
     use_bayesian = st.toggle("Bayesian confidence", value=os.getenv("ENABLE_BAYESIAN", "true").lower() == "true")
     use_markov = st.toggle("Markov recent form", value=os.getenv("ENABLE_MARKOV", "true").lower() == "true")
     use_learning = st.toggle("Use saved learning", value=os.getenv("ENABLE_LEARNING", "true").lower() == "true")
+    use_real_stats = st.toggle("Use real NBA game-log projections", value=os.getenv("ENABLE_REAL_STATS", "true").lower() == "true")
+    nba_season = st.text_input("NBA season", value=os.getenv("NBA_SEASON", current_nba_season()))
+    market_blend = st.slider("Market-line blend", 0.0, 0.85, float(os.getenv("MARKET_BLEND", "0.25")), 0.05)
 
     st.markdown("### Board Filters")
     selected_props = st.multiselect("Props", list(PROP_CONFIG.keys()), default=list(PROP_CONFIG.keys()))
@@ -1264,6 +1559,7 @@ with st.sidebar:
     min_data_score = st.slider("Min data score", 40, 95, DEFAULT_MIN_DATA_SCORE, 1)
     min_edge_scale = st.slider("Edge gate scale", 0.30, 1.50, 0.70, 0.05)
     max_kelly = st.slider("Max Kelly stake", 0.0, 0.10, DEFAULT_MAX_KELLY, 0.005)
+    st.caption(f"EV uses price proxy: {odds_display(EV_PRICE)}. Change EV_PRICE in Railway if needed.")
     show_passes = st.toggle("Show PASS rows", value=True)
 
     st.markdown("### Source")
@@ -1329,6 +1625,9 @@ board = build_board(
     use_bayesian=use_bayesian,
     use_markov=use_markov,
     use_learning=use_learning,
+    use_real_stats=use_real_stats,
+    nba_season=nba_season,
+    market_blend=market_blend,
 )
 
 if save_btn:
@@ -1397,11 +1696,13 @@ with tabs[0]:
           <span class='badge'>Line: {p['line']}</span>
           <span class='badge'>State: {p['markov_state']}</span>
           <span class='badge'>Date: {p.get('date_bucket','')}</span>
+          <span class='badge'>Proj Src: {p.get('projection_source','')}</span>
           <div class='metric-grid'>
-            <div class='metric-box'><div class='metric-label'>Projection</div><div class='metric-value'>{p['projection']:.2f}</div><div class='metric-sub'>Edge {p['edge']:+.2f}</div></div>
-            <div class='metric-box'><div class='metric-label'>Over</div><div class='metric-value'>{p['over_prob']*100:.1f}%</div><div class='metric-sub'>Under {p['under_prob']*100:.1f}%</div></div>
+            <div class='metric-box'><div class='metric-label'>Projection</div><div class='metric-value'>{p['projection']:.2f}</div><div class='metric-sub'>Line {p['line']} | Raw {p['raw_edge']:+.2f}</div></div>
+            <div class='metric-box'><div class='metric-label'>Edge</div><div class='metric-value'>{p['pick_edge']:+.2f}</div><div class='metric-sub'>Prob edge {p['prob_edge']*100:.1f}% | {p['edge_pct']*100:.1f}%</div></div>
+            <div class='metric-box'><div class='metric-label'>Over / Under</div><div class='metric-value'>{p['over_prob']*100:.1f}%</div><div class='metric-sub'>Under {p['under_prob']*100:.1f}%</div></div>
             <div class='metric-box'><div class='metric-label'>Pick Prob</div><div class='metric-value'>{p['pick_prob']*100:.1f}%</div><div class='metric-sub'>Raw {p['raw_pick_prob']*100:.1f}%</div></div>
-            <div class='metric-box'><div class='metric-label'>EV / Kelly</div><div class='metric-value'>{(p['ev'] or 0)*100:.1f}%</div><div class='metric-sub'>Stake ${p['stake']:.2f}</div></div>
+            <div class='metric-box'><div class='metric-label'>EV / Kelly</div><div class='metric-value'>{(p['ev'] or 0)*100:.1f}%</div><div class='metric-sub'>Proxy {odds_display(p.get('ev_price', EV_PRICE))} | Stake ${p['stake']:.2f}</div></div>
             <div class='metric-box'><div class='metric-label'>Data Score</div><div class='metric-value'>{p['data_score']}</div><div class='metric-sub'>CLV {p['clv']:+.2f}</div></div>
           </div>
           <div class='sub'>Game: {p.get('game','')} | Team: {p.get('team','')} | Notes: {reason_text}</div>
@@ -1413,7 +1714,7 @@ with tabs[1]:
     if board:
         display_cols = [
             "signal", "player", "team", "game", "date_bucket", "local_start", "prop", "line", "pick_side",
-            "projection", "over_prob", "under_prob", "pick_prob", "edge", "ev",
+            "projection", "projection_source", "l3", "l5", "l10", "season_avg", "minutes", "over_prob", "under_prob", "pick_prob", "raw_edge", "pick_edge", "edge_pct", "prob_edge", "min_edge", "ev", "ev_price",
             "kelly", "stake", "clv", "data_score", "markov_state", "reasons",
         ]
         df = pd.DataFrame(board).drop(columns=["raw"], errors="ignore")
